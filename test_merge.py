@@ -166,6 +166,7 @@ class StreamMerger(AbstractStreamMerger):
 		return offsets, self._mintime and self._mintime[0]
 
 	async def wakeup(self):
+		# print('@@@@@', 'wakeup', self._mintime, time.time())
 		msg = self._messages[self._mintime[1]]
 		topics = await self.lower(self._messages, msg) or ()
 		if self._mintime[1] not in topics:
@@ -292,6 +293,7 @@ class MergeManager:
 		"""
 		try:
 			# print ('_readone', 'getone', len(self._pending_tp))
+			# print ('_readone', 'getone', time.time(), self._pending_tp)
 			msg = await self._consumer.getone(*self._pending_tp)
 			# print ('_readone', 'getone', msg.topic, msg.partition, self._pending_tp)
 			# print ('_readone', msg.topic, msg.partition, msg.offset)
@@ -313,16 +315,19 @@ class MergeManager:
 			wakeups = sorted(self._wakeups.items(), key=lambda t: t[1])
 			# wait for them in this particular order
 			for partition, timestamp in wakeups:
-				timeout = timestamp - time.time()
+				timeout = (timestamp + self._processor_latency_ms) / 1000 - \
+						time.time()
 				# print ('_sleep', 'timestamp', timeout)
 				if timeout > 0: await asyncio.sleep(timeout)
 				# print ('_sleep', 'timestamp', 'finished')
 				# check that all the pending partitions with the same number are consumed
 				for tp in self._pending_tp:
 					if tp.partition != partition: continue
-					offset = self._offsets.get(tp, 0)
-					# print ('_sleep', 'highwater', offset, assignment.state_value(tp).highwater)
-					if assignment.state_value(tp).highwater > offset:
+					state = assignment.state_value(tp)
+					offset = self._offsets.get(tp, state.position)
+					# print ('_sleep', 'timestamp', state.timestamp, timestamp, 'highwater', offset, state.highwater)
+					if state.timestamp < timestamp + \
+						self._processor_latency_ms or state.highwater > offset:
 						self._wakeups.pop(partition)
 						break
 				# wakeup the processor
@@ -341,8 +346,7 @@ class MergeManager:
 			self._pending_tp.add(tp)
 			self._offsets[tp] = offset
 		if timestamp:
-			self._wakeups[partition] = \
-					(timestamp + self._processor_latency_ms) / 1000
+			self._wakeups[partition] = timestamp
 		else: self._wakeups.pop(partition, None)
 
 	async def _merge_routine(self):
@@ -436,9 +440,7 @@ class MergeManager:
 		if now > self._next_autocommit_deadline:
 			if self._offsets:
 				print ('_maybe_do_autocommit', self._offsets)
-				try:
-					await self._consumer.commit(self._offsets)
-					self._offsets = {}
+				try: await self._consumer.commit(self._offsets)
 				except Errors.KafkaError as error:
 					log.warning("Auto offset commit failed: %s", error)
 					if error.retriable:
@@ -518,7 +520,18 @@ class MergeConsumer(AIOKafkaConsumer):
 	def run(self):
 		return self._merge_manager.run()
 
+"""
+Requirements:
+	kafka with topics test1...test5 created (or auto create)
 
+for i in {1..5}; do bin/kafka-topics.sh --delete --bootstrap-server localhost:9092 --topic "test$i"; done
+for i in {1..5}; do bin/kafka-topics.sh --create --bootstrap-server localhost:9092 --replication-factor 1 --partitions 10 --topic "test$i"; done
+
+Usage:
+	python test_merge.py fill: fills kafka topics with data
+	python test_merge.py: runs the merger from the beginning of the topics
+	python test_merge.py slave: runs the merger from the current offsets
+"""
 if __name__ == "__main__":
 	import sys
 
@@ -532,6 +545,7 @@ if __name__ == "__main__":
 		loop.run_until_complete(producer.start())
 		for i in range(5000):
 			for topic in topics:
+				# data is topic-i-xxxxx...  in order to make long messages that needs to be polled in several requests
 				loop.run_until_complete(producer.send(topic, '-'.join((topic, str(i), 1000*'x')).encode('ascii')))
 		loop.run_until_complete(producer.stop())
 
@@ -543,7 +557,7 @@ if __name__ == "__main__":
 				return int(msg.value.decode('ascii').split('-')[1])
 
 			async def process(self, msg):
-				time.sleep(0.001)
+				time.sleep(0.001) # slow down reading
 				value = tuple(msg.value.decode('ascii').split('-')[:2])
 				results.setdefault(msg.partition, []).append(value)
 				# print('process', msg.partition, value)
@@ -554,7 +568,7 @@ if __name__ == "__main__":
 
 			if not i:
 				if len(sys.argv) < 2 or sys.argv[1] != 'slave':
-					print ('!!!!!!', 'seek_to_beginning')
+					print ('seek_to_beginning')
 					loop.run_until_complete(consumer.seek_to_beginning())
 
 			try: loop.run_until_complete(asyncio.shield(
