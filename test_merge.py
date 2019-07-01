@@ -4,7 +4,6 @@ import logging
 import abc
 import time
 import asyncio
-import sys
 
 from kafka.vendor import six
 
@@ -22,7 +21,7 @@ log = logging.getLogger(__name__)
 class StreamMergeAssignor(AbstractPartitionAssignor):
 	"""
 	A round robin assignator that keeps the same partition numbers
-	of different streams with the sane client
+	of different streams within the same client
 	Deeply inspired from aiokafka.RoundRobinAssignator
 	"""
 	name = 'streammerge'
@@ -120,7 +119,7 @@ class StreamMerger(AbstractStreamMerger):
 	@abc.abstractmethod
 	async def process(self, msg):
 		"""
-		Pocesses a message than needs to be send
+		Pocesses a message than needs to be sent
 		"""
 		...
 
@@ -167,7 +166,6 @@ class StreamMerger(AbstractStreamMerger):
 		return offsets, self._mintime and self._mintime[0]
 
 	async def wakeup(self):
-		# print('@@@@@', 'wakeup', self._mintime, time.time())
 		msg = self._messages[self._mintime[1]]
 		topics = await self.lower(self._messages, msg) or ()
 		if self._mintime[1] not in topics:
@@ -266,13 +264,13 @@ class MergeManager:
 		self._pending_tasks = ()
 		self._closing = asyncio.Future(loop=loop)
 		self._rebalancing = None
+		self._before_rebalancing = None
 		self._merge_task = None
 
 	async def close(self):
 		"""
 		Ends the mege task if running, and do the last commit
 		"""
-		# print ('MergeManager', 'close', self._closing.done())
 		if self._closing.done(): return
 		self._closing.set_result(None)
 		if self._rebalancing:
@@ -280,9 +278,7 @@ class MergeManager:
 			self._rebalancing = None
 		for task in self._pending_tasks:
 			task.cancel()
-			try: await task
-			except asyncio.CancelledError: pass
-		for task in self._pending_tasks: await task
+			await task
 		if self._merge_task:
 			await self._merge_task
 		try: await self._maybe_do_last_autocommit()
@@ -294,25 +290,17 @@ class MergeManager:
 	async def _readone(self):
 		"""
 		A coroutine to read one message among the pending partitions
+		Once everything is ready, returns another coroutine to finish the job
 		"""
 		try:
-			# print ('_readone start')
-			# print ('_readone', 'getone', len(self._pending_tp))
-			# print ('_readone', 'getone', time.time(), self._pending_tp)
 			msg = await self._consumer.getone(*self._pending_tp)
-			# print ('_readone', 'getone', msg.topic, msg.partition, self._pending_tp)
-			# print ('_readone', msg.topic, msg.partition, msg.offset)
 			return self._readone_aux(msg)
-			# partition = msg.partition
-			# tp = TopicPartition(msg.topic, partition)
-			# self._offsets[tp] = msg.offset
-			# self._pending_tp.remove(tp)
-			# offsets, timestamp = await self._processors[partition].feed(msg)
-			# self._update_partition(partition, offsets, timestamp)
 		except asyncio.CancelledError: pass
-		# print ('_readone stop')
 
 	async def _readone_aux(self, msg):
+		"""
+		The coroutine to execute once `_readone` has won the race
+		"""
 		partition = msg.partition
 		tp = TopicPartition(msg.topic, partition)
 		self._offsets[tp] = msg.offset
@@ -324,9 +312,9 @@ class MergeManager:
 		"""
 		A coroutine to sleep and wake up the processors
 		when it's time to process a too old message
+		Once everything is ready, returns another coroutine to finish the job
 		"""
 		try:
-			# print ('_sleep start')
 			assignment = self._subscriptions.subscription.assignment
 			# sort the wakeup timestamps
 			wakeups = sorted(self._wakeups.items(), key=lambda t: t[1])
@@ -334,27 +322,32 @@ class MergeManager:
 			for i, (partition, timestamp) in enumerate(wakeups):
 				timeout = (timestamp + self._processor_latency_ms) / 1000 - \
 						time.time()
-				# print ('_sleep', 'timestamp', timeout)
 				if timeout > 0: await asyncio.sleep(timeout)
-				# print ('_sleep', 'timestamp', 'finished')
-				# check that all the pending partitions with the same number are consumed
+				# check that all the pending partitions with the same number
+				# are consumed
 				update = False # if should wait for highwater update
 				for tp in self._pending_tp:
 					if tp.partition != partition: continue
 					state = assignment.state_value(tp)
 					offset = self._offsets.get(tp, state.position)
-					# print ('_sleep', 'timestamp', state.timestamp, timestamp, 'highwater', offset, state.highwater)
 					# if the partition is not consumed, cancel the wakeup
 					if state.highwater > offset:
 						self._wakeups.pop(partition)
 						break
-					# check that partition highwater is up to date
+					# if the last partition highwater is too old,
+					# wait for a new one
 					elif state.timestamp < timestamp + self._processor_latency_ms:
 						update = True
 				else:
-					# waiting
+					# try again little later for fresher highwater
+					# since there's no more message in cache for this parition
+					# we are sure that it will be updated soon
+					# could be improved by waiting for fetcher
+					# `_proc_fetch_request`, but no such callback
 					if update:
 						timestamp += self._highwater_update_ms
+						# insert back this wakep in the list
+						# list iterator is only using index, so it's working
 						for j in range(i+1, len(wakeups)):
 							if wakeups[j][1] >= timestamp:
 								wakeups.insert(j, (partition, timestamp))
@@ -362,25 +355,22 @@ class MergeManager:
 						else: wakeups.append((partition, timestamp))
 					else:
 						# wakeup the processor to process the oldest message
-						# print ('_sleep stop')
 						return self._sleep_aux(partition)
-						# offsets, timestamp = \
-						# 		await self._processors[partition].wakeup()
-						# self._update_partition(partition, offsets, timestamp)
-						# print ('_sleep stop')
-						# return
-			# no wakeup left, just wait for cancel
+			# no wakeup left, just wait for cancel when `_readone` will finish
 			while True: await asyncio.sleep(100)
 		except asyncio.CancelledError: pass
-		# print ('_sleep stop')
 
 	async def _sleep_aux(self, partition):
+		"""
+		The coroutine to execute once `_sleep` has won the race
+		"""
 		offsets, timestamp = await self._processors[partition].wakeup()
 		self._update_partition(partition, offsets, timestamp)
-		# print ('_sleep stop')
 
 	def _update_partition(self, partition, offsets, timestamp):
-		# print ('_update_partition')
+		"""
+		Updates various structures depending on processors response
+		"""
 		for topic, offset in offsets.items():
 			tp = TopicPartition(topic, partition)
 			self._pending_tp.add(tp)
@@ -398,7 +388,7 @@ class MergeManager:
 			self.build_processors()
 
 			while not self._closing.done():
-
+				# wait for rebalancing to finish
 				if self._rebalancing: await self._rebalancing
 				# time to wait for the next autocommit
 				wait_timeout = await self._maybe_do_autocommit()
@@ -408,32 +398,34 @@ class MergeManager:
 						asyncio.ensure_future(self._sleep(), loop=self._loop),
 						asyncio.ensure_future(self._readone(), loop=self._loop),
 					]
+				# the tasks can be cancelled, by this potion of code
+				# should finish before rebalancing in order to have a
+				# correct final commit
 				try:
-					# print ('asyncio.wait')
+					self._before_rebalancing = asyncio.Future(loop=self._loop)
+					# run the two tasks concurently, see who wins
 					done, self._pending_tasks = await asyncio.wait(self._pending_tasks,
 							return_when=asyncio.FIRST_COMPLETED,
 							timeout=wait_timeout, loop=self._loop)
-				# maybe cancelled by rebalancing, continue
-				except asyncio.TimeoutError:
-					# print ('===', 'timeout', self._pending_tasks)
-					continue
-				# first done wins, other is cancelled
-				# print ('===', 'done', self._pending_tasks, done)
-				if done:
-					for task in self._pending_tasks:
-						task.cancel()
-						try: await task
-						except asyncio.CancelledError: pass
-					for task in done:
-						task = task.result()
-						if task: await task
-					self._pending_tasks = ()
+					# execute the coroutine of the first done, cancel the other one
+					if done:
+						for task in self._pending_tasks:
+							task.cancel()
+							await task
+						for task in done:
+							task = task.result()
+							# can be None if has been cancelled for rebalancing
+							if task: await task
+						self._pending_tasks = ()
+					# else, timed out for autocommit, execute it next turn
+				finally:
+					self._before_rebalancing.set_result(None)
+					self._before_rebalancing = None
 
 		except asyncio.CancelledError:
 			for task in self._pending_tasks:
 				task.cancel()
-				try: await task
-				except asyncio.CancelledError: pass
+				await task
 		except Exception:
 			log.error("Unexpected error in merge routine", exc_info=True)
 			raise Errors.KafkaError("Unexpected error during merge")
@@ -442,8 +434,8 @@ class MergeManager:
 		"""
 		builds the processors and other data structures
 		"""
-		# print ('build_processors')
 		if self._closing.done(): return
+
 		self._wakeups = {}
 		self._offsets = {}
 		self._pending_tp = set(self._consumer.assignment())
@@ -454,7 +446,6 @@ class MergeManager:
 
 		self._processors = {p: self._processor_factory(ts)
 				for p, ts in partitions.items()}
-		# print ('build_processors', 'end rebalancing')
 		if self._rebalancing:
 			self._rebalancing.set_result(None)
 			self._rebalancing = None
@@ -463,13 +454,12 @@ class MergeManager:
 		"""
 		cleans the processors and other data structures, do a last commit
 		"""
-		# print ('clean_processors')
 		self._rebalancing = asyncio.Future(loop=loop)
 		for task in self._pending_tasks:
 			task.cancel()
-			try: await task
-			except asyncio.CancelledError: pass
-		# print ('clean_processors', 'cancel')
+			await task
+		if self._before_rebalancing:
+			await self._before_rebalancing
 		try: await self._maybe_do_last_autocommit()
 		except Errors.KafkaError as err:
 			# We did all we could, all we can is show this to user
@@ -480,7 +470,6 @@ class MergeManager:
 		self._wakeups = {}
 		self._offsets = {}
 		self._pending_tasks = ()
-		# print ('clean_processors', 'clear')
 
 	async def _maybe_do_autocommit(self):
 		"""
@@ -495,7 +484,6 @@ class MergeManager:
 		backoff = self._retry_backoff_ms / 1000
 		if now > self._next_autocommit_deadline:
 			if self._offsets:
-				# print ('_maybe_do_autocommit', self._offsets)
 				try: await self._do_commit()
 				except Errors.KafkaError as error:
 					log.warning("Auto offset commit failed: %s", error)
@@ -519,7 +507,7 @@ class MergeManager:
 		"""
 		if not self._enable_auto_commit or not self._offsets:
 			return
-		# print ('_maybe_do_last_autocommit', self._offsets)
+		for tp, offset in self._offsets.items():
 		await self._do_commit()
 
 	async def _do_commit(self):
@@ -530,18 +518,17 @@ class MergeManager:
 		"""
 		offsets = self._subscriptions.subscription \
 				.assignment.all_consumed_offsets()
-		for tp, offset in self._offsets.items():
-			offsets[tp] = offset
+		offsets.update(self._offsets)
 		await self._consumer.commit(offsets)
 
-	def run(self):
+	async def run(self):
 		"""
 		Returns the main coroutine
 		"""
 		if not self._merge_task:
 			self._merge_task = asyncio.ensure_future(
 					self._merge_routine(), loop=loop)
-		return self._merge_task
+		return await self._merge_task
 
 
 class MergeConsumer(AIOKafkaConsumer):
@@ -591,8 +578,8 @@ class MergeConsumer(AIOKafkaConsumer):
 		await self._client.close()
 		log.debug("The KafkaConsumer has closed.")
 
-	def run(self):
-		return self._merge_manager.run()
+	async def run(self):
+		return await self._merge_manager.run()
 
 """
 Requirements:
@@ -608,6 +595,7 @@ Usage:
 """
 if __name__ == "__main__":
 	import sys
+	import random
 
 	results = {}
 
@@ -633,34 +621,36 @@ if __name__ == "__main__":
 			async def process(self, msg):
 				time.sleep(0.001) # slow down processing
 				value = tuple(msg.value.decode('ascii').split('-')[:2])
+				# print ('process', msg.topic, msg.partition, msg.offset)
 				results.setdefault(msg.partition, []).append(value)
-				# print('process', msg.partition, value)
 
-		for i in range(10):
+		for i in range(20):
 			consumer = MergeConsumer(*topics, loop=loop, processor_factory=Test, group_id='mygroup')
 			loop.run_until_complete(consumer.start())
 
 			if not i:
 				if len(sys.argv) < 2 or sys.argv[1] != 'slave':
-					print ('seek_to_beginning')
+					# print ('=====', 'seek_to_beginning')
 					loop.run_until_complete(consumer.seek_to_beginning())
 
 			try: loop.run_until_complete(asyncio.shield(
-				asyncio.wait_for(consumer.run(), timeout=12, loop=loop)))
+				asyncio.wait_for(consumer.run(), timeout=2 + 10 * random.random(), loop=loop)))
 			except asyncio.TimeoutError: pass
 			loop.run_until_complete(consumer.stop())
 			loop.run_until_complete(asyncio.gather(*asyncio.Task.all_tasks()))
 
-			print ('results', sum(len(r) for r in results.values()))
+			# print ('=====', 'results', sum(len(r) for r in results.values()))
+			for i, r in results.items():
+				# print ('=====', 'results', i, len(r))
 			diff = False
 			for (i, r) in results.items():
 				index = {}
 				prev = None
 				for j, v in enumerate(r):
 					if v in index:
-						print ('duplicate', i, v, index[v], j)
+						# print ('=====', 'duplicate', i, v, index[v], j)
 					index[v] = j
 					if j and int(v[1]) < prev:
-						print ('unordered', i, prev, v, j-1, j)
+						# print ('=====', 'unordered', i, prev, v, j-1, j)
 					prev = int(v[1])
 			if diff or sum(len(r) for r in results.values()) >= 25000: break
