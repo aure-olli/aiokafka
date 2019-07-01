@@ -303,10 +303,35 @@ class MergeManager:
 		"""
 		partition = msg.partition
 		tp = TopicPartition(msg.topic, partition)
+		if tp not in self._offsets: print ('=====', 'offset', tp, msg.offset)
 		self._offsets[tp] = msg.offset
 		self._pending_tp.remove(tp)
 		offsets, timestamp = await self._processors[partition].feed(msg)
 		self._update_partition(partition, offsets, timestamp)
+
+	async def _readmany(self):
+		"""
+		A coroutine to read several message among the pending partitions
+		Once everything is ready, returns another coroutine to finish the job
+		"""
+		try:
+			messages = await self._consumer.getmany(*self._pending_tp,
+					max_records_per_partition=1)
+			return self._readmany_aux((msg for records in messages.values()
+					for msg in records))
+		except asyncio.CancelledError: pass
+
+	async def _readmany_aux(self, messages):
+		"""
+		The coroutine to execute once `_readmany` has won the race
+		"""
+		for msg in messages:
+			partition = msg.partition
+			tp = TopicPartition(msg.topic, partition)
+			self._offsets[tp] = msg.offset
+			self._pending_tp.remove(tp)
+			offsets, timestamp = await self._processors[partition].feed(msg)
+			self._update_partition(partition, offsets, timestamp)
 
 	async def _sleep(self):
 		"""
@@ -356,7 +381,7 @@ class MergeManager:
 					else:
 						# wakeup the processor to process the oldest message
 						return self._sleep_aux(partition)
-			# no wakeup left, just wait for cancel when `_readone` will finish
+			# no wakeup left, just wait for cancel when `_readmany` will finish
 			while True: await asyncio.sleep(100)
 		except asyncio.CancelledError: pass
 
@@ -396,7 +421,7 @@ class MergeManager:
 				if not self._pending_tasks:
 					self._pending_tasks = [
 						asyncio.ensure_future(self._sleep(), loop=self._loop),
-						asyncio.ensure_future(self._readone(), loop=self._loop),
+						asyncio.ensure_future(self._readmany(), loop=self._loop),
 					]
 				# the tasks can be cancelled, by this potion of code
 				# should finish before rebalancing in order to have a
@@ -507,7 +532,6 @@ class MergeManager:
 		"""
 		if not self._enable_auto_commit or not self._offsets:
 			return
-		for tp, offset in self._offsets.items():
 		await self._do_commit()
 
 	async def _do_commit(self):
@@ -639,18 +663,18 @@ if __name__ == "__main__":
 			loop.run_until_complete(consumer.stop())
 			loop.run_until_complete(asyncio.gather(*asyncio.Task.all_tasks()))
 
-			# print ('=====', 'results', sum(len(r) for r in results.values()))
-			for i, r in results.items():
-				# print ('=====', 'results', i, len(r))
+			print ('=====', 'results', sum(len(r) for r in results.values()))
+			# for i, r in results.items():
+			# 	print ('=====', 'results', i, len(r))
 			diff = False
 			for (i, r) in results.items():
 				index = {}
 				prev = None
 				for j, v in enumerate(r):
 					if v in index:
-						# print ('=====', 'duplicate', i, v, index[v], j)
+						print ('=====', 'duplicate', i, v, index[v], j)
 					index[v] = j
 					if j and int(v[1]) < prev:
-						# print ('=====', 'unordered', i, prev, v, j-1, j)
+						print ('=====', 'unordered', i, prev, v, j-1, j)
 					prev = int(v[1])
 			if diff or sum(len(r) for r in results.values()) >= 25000: break

@@ -1054,7 +1054,8 @@ class Fetcher:
             yield from waiter
 
     @asyncio.coroutine
-    def fetched_records(self, partitions, timeout=0, max_records=None):
+    def fetched_records(self, partitions, timeout=0, max_records=None,
+            max_records_per_partition=None):
         """ Returns previously fetched records and updates consumed offsets.
         """
         while True:
@@ -1074,7 +1075,10 @@ class Fetcher:
                     continue
                 res_or_error = self._records[tp]
                 if type(res_or_error) == FetchResult:
-                    records = res_or_error.getall(max_records)
+                    limit = max_records if max_records_per_partition is None \
+                        else max_records_per_partition if max_records is None \
+                        else min(max_records, max_records_per_partition)
+                    records = res_or_error.getall(limit)
                     if not res_or_error.has_more():
                         # We processed all messages - request new ones
                         del self._records[tp]
