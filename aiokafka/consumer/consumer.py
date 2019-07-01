@@ -236,6 +236,7 @@ class AIOKafkaConsumer(object):
                  heartbeat_interval_ms=3000,
                  consumer_timeout_ms=200,
                  max_poll_records=None,
+                 max_poll_records_per_partition=None,
                  ssl_context=None,
                  security_protocol='PLAINTEXT',
                  api_version='auto',
@@ -250,6 +251,11 @@ class AIOKafkaConsumer(object):
         if max_poll_records is not None and (
                 not isinstance(max_poll_records, int) or max_poll_records < 1):
             raise ValueError("`max_poll_records` should be positive Integer")
+        if max_poll_records_per_partition is not None and (
+                not isinstance(max_poll_records_per_partition, int) or
+                        max_poll_records_per_partition < 1):
+            raise ValueError("`max_poll_records_per_partition` should be "
+                "positive Integer")
 
         if rebalance_timeout_ms is None:
             rebalance_timeout_ms = session_timeout_ms
@@ -286,6 +292,7 @@ class AIOKafkaConsumer(object):
         self._max_partition_fetch_bytes = max_partition_fetch_bytes
         self._exclude_internal_topics = exclude_internal_topics
         self._max_poll_records = max_poll_records
+        self._max_poll_records_per_partition = max_poll_records_per_partition
         self._consumer_timeout = consumer_timeout_ms / 1000
         self._isolation_level = isolation_level
         self._rebalance_timeout_ms = rebalance_timeout_ms
@@ -1084,7 +1091,8 @@ class AIOKafkaConsumer(object):
             msg = await self._fetcher.next_record(partitions)
         return msg
 
-    async def getmany(self, *partitions, timeout_ms=0, max_records=None):
+    async def getmany(self, *partitions, timeout_ms=0, max_records=None,
+        max_records_per_partition=None):
         """Get messages from assigned topics / partitions.
 
         Prefetched messages are returned in batches by topic-partition.
@@ -1132,7 +1140,9 @@ class AIOKafkaConsumer(object):
         with self._subscription.fetch_context():
             records = await self._fetcher.fetched_records(
                 partitions, timeout,
-                max_records=max_records or self._max_poll_records)
+                max_records=max_records or self._max_poll_records,
+                max_records_per_partition=max_records_per_partition or \
+                        self._max_poll_records_per_partition)
         return records
 
     def pause(self, *partitions):
