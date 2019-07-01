@@ -417,13 +417,12 @@ class Fetcher:
 
         self._closed = False
 
-    @asyncio.coroutine
-    def close(self):
+    async def close(self):
         self._closed = True
 
         self._fetch_task.cancel()
         try:
-            yield from self._fetch_task
+            await self._fetch_task
         except asyncio.CancelledError:
             pass
 
@@ -433,7 +432,7 @@ class Fetcher:
 
         for x in self._pending_tasks:
             x.cancel()
-            yield from x
+            await x
 
     def _notify(self, future):
         if future is not None and not future.done():
@@ -453,8 +452,7 @@ class Fetcher:
     def error_future(self):
         return self._fetch_task
 
-    @asyncio.coroutine
-    def _fetch_requests_routine(self):
+    async def _fetch_requests_routine(self):
         """ Implements a background task to populate internal fetch queue
         ``self._records`` with prefetched messages. This helps isolate the
         ``getall/getone`` calls from actual calls to broker. This way we don't
@@ -492,7 +490,7 @@ class Fetcher:
                         # cancellation
                         if not task.done():
                             task.cancel()
-                        yield from task
+                        await task
                     self._pending_tasks.clear()
                     self._records.clear()
 
@@ -501,7 +499,7 @@ class Fetcher:
                             subscription.assignment is None:
                         try:
                             waiter = self._subscriptions.wait_for_assignment()
-                            yield from waiter
+                            await waiter
                         except Errors.KafkaError:
                             # Critical coordination waiters will be passed
                             # to user, but fetcher can just ignore those
@@ -533,7 +531,7 @@ class Fetcher:
                     fut = self._client.force_metadata_update()
                     other_futs.append(fut)
 
-                done_set, _ = yield from asyncio.wait(
+                done_set, _ = await asyncio.wait(
                     chain(self._pending_tasks, other_futs, resume_futures),
                     loop=self._loop,
                     timeout=timeout,
@@ -653,11 +651,10 @@ class Fetcher:
             resume_futures
         )
 
-    @asyncio.coroutine
-    def _proc_fetch_request(self, assignment, node_id, request):
+    async def _proc_fetch_request(self, assignment, node_id, request):
         needs_wakeup = False
         try:
-            response = yield from self._client.send(node_id, request)
+            response = await self._client.send(node_id, request)
         except Errors.KafkaError as err:
             log.error("Failed fetch messages from %s: %s", node_id, err)
             return False
@@ -770,8 +767,7 @@ class Fetcher:
         self._records[tp] = FetchError(
             error=error, backoff=self._prefetch_backoff, loop=self._loop)
 
-    @asyncio.coroutine
-    def _update_fetch_positions(self, assignment, node_id, tps):
+    async def _update_fetch_positions(self, assignment, node_id, tps):
         """ This task will be called if there is no valid position for
         partition. It may be right after assignment, on seek_to_* calls of
         Consumer or if current position went out of range.
@@ -787,7 +783,7 @@ class Fetcher:
                 continue
 
             try:
-                committed = yield from tp_state.fetch_committed()
+                committed = await tp_state.fetch_committed()
             except asyncio.CancelledError:
                 return needs_wakeup
             assert committed is not None
@@ -831,11 +827,11 @@ class Fetcher:
 
         try:
             try:
-                offsets = yield from self._proc_offset_request(
+                offsets = await self._proc_offset_request(
                     node_id, topic_data)
             except Errors.KafkaError as err:
                 log.error("Failed fetch offsets from %s: %s", node_id, err)
-                yield from asyncio.sleep(self._retry_backoff, loop=self._loop)
+                await asyncio.sleep(self._retry_backoff, loop=self._loop)
                 return needs_wakeup
         except asyncio.CancelledError:
             return needs_wakeup
@@ -848,8 +844,7 @@ class Fetcher:
                 tp_state.reset_to(offset)
         return needs_wakeup
 
-    @asyncio.coroutine
-    def _retrieve_offsets(self, timestamps, timeout_ms=float("inf")):
+    async def _retrieve_offsets(self, timestamps, timeout_ms=float("inf")):
         """ Fetch offset for each partition passed in ``timestamps`` map.
 
         Blocks until offsets are obtained, a non-retriable exception is raised
@@ -874,7 +869,7 @@ class Fetcher:
         remaining = timeout
         while True:
             try:
-                offsets = yield from asyncio.wait_for(
+                offsets = await asyncio.wait_for(
                     self._proc_offset_requests(timestamps),
                     timeout=None if remaining == float("inf") else remaining,
                     loop=self._loop
@@ -890,14 +885,13 @@ class Fetcher:
                 remaining = max(0, remaining - elapsed)
                 if remaining < self._retry_backoff:
                     break
-                yield from asyncio.sleep(self._retry_backoff, loop=self._loop)
+                await asyncio.sleep(self._retry_backoff, loop=self._loop)
             else:
                 return offsets
         raise KafkaTimeoutError(
             "Failed to get offsets by times in %s ms" % timeout_ms)
 
-    @asyncio.coroutine
-    def _proc_offset_requests(self, timestamps):
+    async def _proc_offset_requests(self, timestamps):
         """ Fetch offsets for each partition in timestamps dict. This may send
         request to multiple nodes, based on who is Leader for partition.
 
@@ -910,7 +904,7 @@ class Fetcher:
         """
         # The could be several places where we triggered an update, so only
         # wait for it once here
-        yield from self._client._maybe_wait_metadata()
+        await self._client._maybe_wait_metadata()
 
         # Group it in hierarhy `node` -> `topic` -> `[(partition, offset)]`
         timestamps_by_node = collections.defaultdict(
@@ -939,13 +933,12 @@ class Fetcher:
                 self._proc_offset_request(node_id, topic_data)
             )
         offsets = {}
-        res = yield from asyncio.gather(*futs, loop=self._loop)
+        res = await asyncio.gather(*futs, loop=self._loop)
         for partial_offsets in res:
             offsets.update(partial_offsets)
         return offsets
 
-    @asyncio.coroutine
-    def _proc_offset_request(self, node_id, topic_data):
+    async def _proc_offset_request(self, node_id, topic_data):
         if self._client.api_version < (0, 10, 1):
             version = 0
             # Version 0 had another field `max_offsets`, set it to `1`
@@ -955,7 +948,7 @@ class Fetcher:
             version = 1
         request = OffsetRequest[version](-1, list(topic_data.items()))
 
-        response = yield from self._client.send(node_id, request)
+        response = await self._client.send(node_id, request)
 
         res_offsets = {}
         for topic, part_data in response.topics:
@@ -1008,8 +1001,7 @@ class Fetcher:
                     raise error_type(partition)
         return res_offsets
 
-    @asyncio.coroutine
-    def next_record(self, partitions):
+    async def next_record(self, partitions):
         """ Return one fetched records
 
         This method will contain a little overhead as we will do more work this
@@ -1026,7 +1018,7 @@ class Fetcher:
             # assignment is finished, we don't want to return records, that may
             # not belong to this instance after rebalance.
             if self._subscriptions.reassignment_in_progress:
-                yield from self._subscriptions.wait_for_assignment()
+                await self._subscriptions.wait_for_assignment()
 
             for tp in list(self._records.keys()):
                 if partitions and tp not in partitions:
@@ -1051,10 +1043,9 @@ class Fetcher:
 
             # No messages ready. Wait for some to arrive
             waiter = self._create_fetch_waiter()
-            yield from waiter
+            await waiter
 
-    @asyncio.coroutine
-    def fetched_records(self, partitions, timeout=0, max_records=None,
+    async def fetched_records(self, partitions, timeout=0, max_records=None,
             max_records_per_partition=None):
         """ Returns previously fetched records and updates consumed offsets.
         """
@@ -1063,7 +1054,7 @@ class Fetcher:
             # assignment is finished, we don't want to return records, that may
             # not belong to this instance after rebalance.
             if self._subscriptions.reassignment_in_progress:
-                yield from self._subscriptions.wait_for_assignment()
+                await self._subscriptions.wait_for_assignment()
 
             start_time = self._loop.time()
             drained = {}
@@ -1106,7 +1097,7 @@ class Fetcher:
                 return drained
 
             waiter = self._create_fetch_waiter()
-            done, _ = yield from asyncio.wait(
+            done, _ = await asyncio.wait(
                 [waiter], timeout=timeout, loop=self._loop)
 
             if not done or self._closed:
@@ -1119,9 +1110,8 @@ class Fetcher:
             timeout = timeout - (self._loop.time() - start_time)
             timeout = max(0, timeout)
 
-    @asyncio.coroutine
-    def get_offsets_by_times(self, timestamps, timeout_ms):
-        offsets = yield from self._retrieve_offsets(timestamps, timeout_ms)
+    async def get_offsets_by_times(self, timestamps, timeout_ms):
+        offsets = await self._retrieve_offsets(timestamps, timeout_ms)
         for tp in timestamps:
             if tp not in offsets:
                 offsets[tp] = None
@@ -1133,18 +1123,16 @@ class Fetcher:
                     offsets[tp] = OffsetAndTimestamp(offset, timestamp)
         return offsets
 
-    @asyncio.coroutine
-    def beginning_offsets(self, partitions, timeout_ms):
+    async def beginning_offsets(self, partitions, timeout_ms):
         timestamps = {tp: OffsetResetStrategy.EARLIEST for tp in partitions}
-        offsets = yield from self._retrieve_offsets(timestamps, timeout_ms)
+        offsets = await self._retrieve_offsets(timestamps, timeout_ms)
         return {
             tp: offset for (tp, (offset, ts)) in offsets.items()
         }
 
-    @asyncio.coroutine
-    def end_offsets(self, partitions, timeout_ms):
+    async def end_offsets(self, partitions, timeout_ms):
         timestamps = {tp: OffsetResetStrategy.LATEST for tp in partitions}
-        offsets = yield from self._retrieve_offsets(timestamps, timeout_ms)
+        offsets = await self._retrieve_offsets(timestamps, timeout_ms)
         return {
             tp: offset for (tp, (offset, ts)) in offsets.items()
         }

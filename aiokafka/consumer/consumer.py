@@ -16,7 +16,7 @@ from aiokafka.errors import (
 )
 from aiokafka.structs import TopicPartition
 from aiokafka.util import (
-    PY_341, PY_35, PY_352, PY_36, commit_structure_validate
+    PY_36, commit_structure_validate
 )
 from aiokafka import __version__
 
@@ -313,26 +313,22 @@ class AIOKafkaConsumer(object):
             self._client.set_topics(topics)
             self._subscription.subscribe(topics=topics)
 
-    if PY_341:
-        # Warn if consumer was not closed properly
-        # We don't attempt to close the Consumer, as __del__ is synchronous
-        def __del__(self, _warnings=warnings):
-            if self._closed is False:
-                if PY_36:
-                    kwargs = {'source': self}
-                else:
-                    kwargs = {}
-                _warnings.warn("Unclosed AIOKafkaConsumer {!r}".format(self),
-                               ResourceWarning,
-                               **kwargs)
-                context = {'consumer': self,
-                           'message': 'Unclosed AIOKafkaConsumer'}
-                if self._source_traceback is not None:
-                    context['source_traceback'] = self._source_traceback
-                self._loop.call_exception_handler(context)
+    def __del__(self, _warnings=warnings):
+        if self._closed is False:
+            if PY_36:
+                kwargs = {'source': self}
+            else:
+                kwargs = {}
+            _warnings.warn("Unclosed AIOKafkaConsumer {!r}".format(self),
+                           ResourceWarning,
+                           **kwargs)
+            context = {'consumer': self,
+                       'message': 'Unclosed AIOKafkaConsumer'}
+            if self._source_traceback is not None:
+                context['source_traceback'] = self._source_traceback
+            self._loop.call_exception_handler(context)
 
-    @asyncio.coroutine
-    def start(self):
+    async def start(self):
         """ Connect to Kafka cluster. This will:
 
             * Load metadata for all cluster nodes and partition allocation
@@ -340,8 +336,8 @@ class AIOKafkaConsumer(object):
             * Join group if ``group_id`` provided
         """
         assert self._fetcher is None, "Did you call `start` twice?"
-        yield from self._client.bootstrap()
-        yield from self._wait_topics()
+        await self._client.bootstrap()
+        await self._wait_topics()
 
         if self._client.api_version < (0, 9):
             raise ValueError("Unsupported Kafka version: {}".format(
@@ -386,7 +382,7 @@ class AIOKafkaConsumer(object):
                 if self._subscription.partitions_auto_assigned():
                     # Either we passed `topics` to constructor or `subscribe`
                     # was called before `start`
-                    yield from self._subscription.wait_for_assignment()
+                    await self._subscription.wait_for_assignment()
                 else:
                     # `assign` was called before `start`. We did not start
                     # this task on that call, as coordinator was yet to be
@@ -404,14 +400,13 @@ class AIOKafkaConsumer(object):
                 if self._subscription.partitions_auto_assigned():
                     # Either we passed `topics` to constructor or `subscribe`
                     # was called before `start`
-                    yield from self._client.force_metadata_update()
+                    await self._client.force_metadata_update()
                     self._coordinator.assign_all_partitions(check_unknown=True)
 
-    @asyncio.coroutine
-    def _wait_topics(self):
+    async def _wait_topics(self):
         if self._subscription.subscription is not None:
             for topic in self._subscription.subscription.topics:
-                yield from self._client._wait_on_metadata(topic)
+                await self._client._wait_on_metadata(topic)
 
     def _validate_topics(self, topics):
         if not isinstance(topics, (tuple, set, list)):
@@ -466,8 +461,7 @@ class AIOKafkaConsumer(object):
         """
         return self._subscription.assigned_partitions()
 
-    @asyncio.coroutine
-    def stop(self):
+    async def stop(self):
         """ Close the consumer, while waiting for finilizers:
 
             * Commit last consumed message if autocommit enabled
@@ -478,14 +472,13 @@ class AIOKafkaConsumer(object):
         log.debug("Closing the KafkaConsumer.")
         self._closed = True
         if self._coordinator:
-            yield from self._coordinator.close()
+            await self._coordinator.close()
         if self._fetcher:
-            yield from self._fetcher.close()
-        yield from self._client.close()
+            await self._fetcher.close()
+        await self._client.close()
         log.debug("The KafkaConsumer has closed.")
 
-    @asyncio.coroutine
-    def commit(self, offsets=None):
+    async def commit(self, offsets=None):
         """ Commit offsets to Kafka.
 
         This commits offsets only to Kafka. The offsets committed using this
@@ -552,10 +545,9 @@ class AIOKafkaConsumer(object):
                     raise IllegalStateError(
                         "Partition {} is not assigned".format(tp))
 
-        yield from self._coordinator.commit_offsets(assignment, offsets)
+        await self._coordinator.commit_offsets(assignment, offsets)
 
-    @asyncio.coroutine
-    def committed(self, partition):
+    async def committed(self, partition):
         """ Get the last committed offset for the given partition. (whether the
         commit happened by this process or another).
 
@@ -578,7 +570,7 @@ class AIOKafkaConsumer(object):
         if self._group_id is None:
             raise IllegalOperation("Requires group_id")
 
-        commit_map = yield from self._coordinator.fetch_committed_offsets(
+        commit_map = await self._coordinator.fetch_committed_offsets(
             [partition])
         if partition in commit_map:
             committed = commit_map[partition].offset
@@ -588,14 +580,13 @@ class AIOKafkaConsumer(object):
             committed = None
         return committed
 
-    @asyncio.coroutine
-    def topics(self):
+    async def topics(self):
         """ Get all topics the user is authorized to view.
 
         Returns:
             set: topics
         """
-        cluster = yield from self._client.fetch_all_metadata()
+        cluster = await self._client.fetch_all_metadata()
         return cluster.topics()
 
     def partitions_for_topic(self, topic):
@@ -612,8 +603,7 @@ class AIOKafkaConsumer(object):
         """
         return self._client.cluster.partitions_for_topic(topic)
 
-    @asyncio.coroutine
-    def position(self, partition):
+    async def position(self, partition):
         """ Get the offset of the *next record* that will be fetched (if a
         record with that offset exists on broker).
 
@@ -640,7 +630,7 @@ class AIOKafkaConsumer(object):
             tp_state = assignment.state_value(partition)
             if not tp_state.has_valid_position:
                 self._coordinator.check_errors()
-                yield from asyncio.wait(
+                await asyncio.wait(
                     [tp_state.wait_for_position(),
                      assignment.unassign_future],
                     timeout=self._request_timeout_ms / 1000,
@@ -652,7 +642,7 @@ class AIOKafkaConsumer(object):
                             'Partition {} is not assigned'.format(partition))
                     if self._subscription.subscription.assignment is None:
                         self._coordinator.check_errors()
-                        yield from self._subscription.wait_for_assignment()
+                        await self._subscription.wait_for_assignment()
                     continue
             return tp_state.position
 
@@ -731,8 +721,7 @@ class AIOKafkaConsumer(object):
         log.debug("Seeking to offset %s for partition %s", offset, partition)
         self._fetcher.seek_to(partition, offset)
 
-    @asyncio.coroutine
-    def seek_to_beginning(self, *partitions):
+    async def seek_to_beginning(self, *partitions):
         """ Seek to the oldest available offset for partitions.
 
         Arguments:
@@ -766,7 +755,7 @@ class AIOKafkaConsumer(object):
         fut = self._fetcher.request_offset_reset(
             partitions, OffsetResetStrategy.EARLIEST)
         assignment = self._subscription.subscription.assignment
-        yield from asyncio.wait(
+        await asyncio.wait(
             [fut, assignment.unassign_future],
             timeout=self._request_timeout_ms / 1000,
             return_when=asyncio.FIRST_COMPLETED,
@@ -775,8 +764,7 @@ class AIOKafkaConsumer(object):
         self._coordinator.check_errors()
         return fut.done()
 
-    @asyncio.coroutine
-    def seek_to_end(self, *partitions):
+    async def seek_to_end(self, *partitions):
         """Seek to the most recent available offset for partitions.
 
         Arguments:
@@ -809,7 +797,7 @@ class AIOKafkaConsumer(object):
         fut = self._fetcher.request_offset_reset(
             partitions, OffsetResetStrategy.LATEST)
         assignment = self._subscription.subscription.assignment
-        yield from asyncio.wait(
+        await asyncio.wait(
             [fut, assignment.unassign_future],
             timeout=self._request_timeout_ms / 1000,
             return_when=asyncio.FIRST_COMPLETED,
@@ -818,8 +806,7 @@ class AIOKafkaConsumer(object):
         self._coordinator.check_errors()
         return fut.done()
 
-    @asyncio.coroutine
-    def seek_to_committed(self, *partitions):
+    async def seek_to_committed(self, *partitions):
         """ Seek to the committed offset for partitions.
 
         Arguments:
@@ -850,13 +837,12 @@ class AIOKafkaConsumer(object):
                     "Partitions {} are not assigned".format(not_assigned))
 
         for tp in partitions:
-            offset = yield from self.committed(tp)
+            offset = await self.committed(tp)
             log.debug("Seeking to committed of partition %s %s", tp, offset)
             if offset and offset > 0:
                 self._fetcher.seek_to(tp, offset)
 
-    @asyncio.coroutine
-    def offsets_for_times(self, timestamps):
+    async def offsets_for_times(self, timestamps):
         """
         Look up the offsets for the given partitions by timestamp. The returned
         offset for each partition is the earliest offset whose timestamp is
@@ -901,12 +887,11 @@ class AIOKafkaConsumer(object):
                 raise ValueError(
                     "The target time for partition {} is {}. The target time "
                     "cannot be negative.".format(tp, ts))
-        offsets = yield from self._fetcher.get_offsets_by_times(
+        offsets = await self._fetcher.get_offsets_by_times(
             timestamps, self._request_timeout_ms)
         return offsets
 
-    @asyncio.coroutine
-    def beginning_offsets(self, partitions):
+    async def beginning_offsets(self, partitions):
         """ Get the first offset for the given partitions.
 
         This method does not change the current consumer position of the
@@ -935,12 +920,11 @@ class AIOKafkaConsumer(object):
             raise UnsupportedVersionError(
                 "offsets_for_times API not supported for cluster version {}"
                 .format(self._client.api_version))
-        offsets = yield from self._fetcher.beginning_offsets(
+        offsets = await self._fetcher.beginning_offsets(
             partitions, self._request_timeout_ms)
         return offsets
 
-    @asyncio.coroutine
-    def end_offsets(self, partitions):
+    async def end_offsets(self, partitions):
         """ Get the last offset for the given partitions. The last offset of a
         partition is the offset of the upcoming message, i.e. the offset of the
         last available message + 1.
@@ -971,7 +955,7 @@ class AIOKafkaConsumer(object):
             raise UnsupportedVersionError(
                 "offsets_for_times API not supported for cluster version {}"
                 .format(self._client.api_version))
-        offsets = yield from self._fetcher.end_offsets(
+        offsets = await self._fetcher.end_offsets(
             partitions, self._request_timeout_ms)
         return offsets
 
@@ -1062,8 +1046,7 @@ class AIOKafkaConsumer(object):
         log.info(
             "Unsubscribed all topics or patterns and assigned partitions")
 
-    @asyncio.coroutine
-    def getone(self, *partitions):
+    async def getone(self, *partitions):
         """
         Get one message from Kafka.
         If no new messages prefetched, this method will wait for it.
@@ -1105,11 +1088,10 @@ class AIOKafkaConsumer(object):
         self._coordinator.check_errors()
 
         with self._subscription.fetch_context():
-            msg = yield from self._fetcher.next_record(partitions)
+            msg = await self._fetcher.next_record(partitions)
         return msg
 
-    @asyncio.coroutine
-    def getmany(self, *partitions, timeout_ms=0, max_records=None,
+    async def getmany(self, *partitions, timeout_ms=0, max_records=None,
         max_records_per_partition=None):
         """Get messages from assigned topics / partitions.
 
@@ -1156,7 +1138,7 @@ class AIOKafkaConsumer(object):
 
         timeout = timeout_ms / 1000
         with self._subscription.fetch_context():
-            records = yield from self._fetcher.fetched_records(
+            records = await self._fetcher.fetched_records(
                 partitions, timeout,
                 max_records=max_records or self._max_poll_records,
                 max_records_per_partition=max_records_per_partition or \
@@ -1206,33 +1188,27 @@ class AIOKafkaConsumer(object):
             log.debug("Resuming partition %s", partition)
             self._subscription.resume(partition)
 
-    if PY_35:
-        def __aiter__(self):
-            if self._closed:
-                raise ConsumerStoppedError()
-            return self
+    def __aiter__(self):
+        if self._closed:
+            raise ConsumerStoppedError()
+        return self
 
-        # Old 3.5 versions require a coroutine
-        if not PY_352:
-            __aiter__ = asyncio.coroutine(__aiter__)
+    async def __anext__(self):
+        """Asyncio iterator interface for consumer
 
-        @asyncio.coroutine
-        def __anext__(self):
-            """Asyncio iterator interface for consumer
-
-            Note:
-                TopicAuthorizationFailedError and OffsetOutOfRangeError
-                exceptions can be raised in iterator.
-                All other KafkaError exceptions will be logged and not raised
-            """
-            while True:
-                try:
-                    return (yield from self.getone())
-                except ConsumerStoppedError:
-                    raise StopAsyncIteration  # noqa: F821
-                except (TopicAuthorizationFailedError,
-                        OffsetOutOfRangeError,
-                        NoOffsetForPartitionError) as err:
-                    raise err
-                except RecordTooLargeError:
-                    log.exception("error in consumer iterator: %s")
+        Note:
+            TopicAuthorizationFailedError and OffsetOutOfRangeError
+            exceptions can be raised in iterator.
+            All other KafkaError exceptions will be logged and not raised
+        """
+        while True:
+            try:
+                return (await self.getone())
+            except ConsumerStoppedError:
+                raise StopAsyncIteration  # noqa: F821
+            except (TopicAuthorizationFailedError,
+                    OffsetOutOfRangeError,
+                    NoOffsetForPartitionError) as err:
+                raise err
+            except RecordTooLargeError:
+                log.exception("error in consumer iterator: %s")
