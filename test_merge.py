@@ -18,6 +18,11 @@ import aiokafka.errors as Errors
 log = logging.getLogger(__name__)
 
 
+class UnmergeableTopcis(Exception):
+    """ Raised on `StreamMergeAssignor.assign` when the topics don't have
+    	similar partitions.
+    """
+
 class StreamMergeAssignor(AbstractPartitionAssignor):
 	"""
 	A round robin assignator that keeps the same partition numbers
@@ -36,20 +41,23 @@ class StreamMergeAssignor(AbstractPartitionAssignor):
 				all_topics = set(metadata.subscription)
 			elif all_topics != set(metadata.subscription):
 				diff = all_topics.symmetric_difference(metadata.subscription)
-				raise RuntimeError('Topic(s) %s do not appear in all members',
-					', '.join(diff))
+				raise UnmergeableTopcis(
+						'Topic(s) %s do not appear in all members',
+						', '.join(diff))
 		# get all partition numbers and check every topic has the same
 		all_partitions = None
 		for topic in all_topics:
 			partitions = cluster.partitions_for_topic(topic)
 			if partitions is None:
-				raise RuntimeError('No partition metadata for topic %s', topic)
+				raise UnmergeableTopcis(
+						'No partition metadata for topic %s', topic)
 			if all_partitions is None:
 				all_partitions = set(partitions)
 			elif all_partitions != set(partitions):
 				diff = all_partitions.symmetric_difference(partitions)
-				raise RuntimeError('Partition(s) %s do not appear in all topics',
-					', '.join(str(p) for p in diff))
+				raise UnmergeableTopcis(
+						'Partition(s) %s do not appear in all topics',
+						', '.join(str(p) for p in diff))
 		all_partitions = sorted(all_partitions)
 
 		assignment = collections.defaultdict(lambda: collections.defaultdict(list))
@@ -262,7 +270,7 @@ class MergeManager:
 		self._wakeups = {}
 		self._offsets = {}
 		self._pending_tasks = ()
-		self._closing = asyncio.Future(loop=loop)
+		self._closed = False
 		self._rebalancing = None
 		self._before_rebalancing = None
 		self._merge_task = None
@@ -271,16 +279,18 @@ class MergeManager:
 		"""
 		Ends the mege task if running, and do the last commit
 		"""
-		if self._closing.done(): return
-		self._closing.set_result(None)
+		if self._closed: return
+		self._closed = True
+		if self._merge_task:
+			self._merge_task.cancel()
+			try: await self._merge_task
+			except asyncio.CancelledError: pass
+			self._merge_task = None
+		if self._pending_tasks:
+			await asyncio.wait(self._pending_tasks)
 		if self._rebalancing:
 			self._rebalancing.cancel()
 			self._rebalancing = None
-		for task in self._pending_tasks:
-			task.cancel()
-			await task
-		if self._merge_task:
-			await self._merge_task
 		try: await self._maybe_do_last_autocommit()
 		except Errors.KafkaError as err:
 			# We did all we could, all we can is show this to user
@@ -294,8 +304,8 @@ class MergeManager:
 		"""
 		try:
 			msg = await self._consumer.getone(*self._pending_tp)
-			return self._readone_aux(msg)
-		except asyncio.CancelledError: pass
+			return self._loop.create_task(self._readone_aux(msg))
+		except (asyncio.CancelledError, Errors.ConsumerStoppedError): pass
 
 	async def _readone_aux(self, msg):
 		"""
@@ -303,7 +313,6 @@ class MergeManager:
 		"""
 		partition = msg.partition
 		tp = TopicPartition(msg.topic, partition)
-		if tp not in self._offsets: print ('=====', 'offset', tp, msg.offset)
 		self._offsets[tp] = msg.offset
 		self._pending_tp.remove(tp)
 		offsets, timestamp = await self._processors[partition].feed(msg)
@@ -317,14 +326,16 @@ class MergeManager:
 		try:
 			messages = await self._consumer.getmany(*self._pending_tp,
 					max_records_per_partition=1)
-			return self._readmany_aux((msg for records in messages.values()
-					for msg in records))
-		except asyncio.CancelledError: pass
+			if not messages: return None
+			return self._loop.create_task(self._readmany_aux(
+					(msg for records in messages.values() for msg in records)))
+		except (asyncio.CancelledError, Errors.ConsumerStoppedError): pass
 
 	async def _readmany_aux(self, messages):
-		"""
+		"""`
 		The coroutine to execute once `_readmany` has won the race
 		"""
+		# await asyncio.wait([_readone_aux(msg) for msg in messages])
 		for msg in messages:
 			partition = msg.partition
 			tp = TopicPartition(msg.topic, partition)
@@ -380,7 +391,8 @@ class MergeManager:
 						else: wakeups.append((partition, timestamp))
 					else:
 						# wakeup the processor to process the oldest message
-						return self._sleep_aux(partition)
+						return self._loop.create_task(
+								self._sleep_aux(partition))
 			# no wakeup left, just wait for cancel when `_readmany` will finish
 			while True: await asyncio.sleep(100)
 		except asyncio.CancelledError: pass
@@ -408,11 +420,12 @@ class MergeManager:
 		"""
 		The main routine, reading data and committing offsets
 		"""
+		done = ()
 		try:
 			# init the rocessors
 			self.build_processors()
 
-			while not self._closing.done():
+			while not self._closed:
 				# wait for rebalancing to finish
 				if self._rebalancing: await self._rebalancing
 				# time to wait for the next autocommit
@@ -420,8 +433,8 @@ class MergeManager:
 				# two concurrent tasks: read data and wakeup processors
 				if not self._pending_tasks:
 					self._pending_tasks = [
-						asyncio.ensure_future(self._sleep(), loop=self._loop),
-						asyncio.ensure_future(self._readmany(), loop=self._loop),
+						self._loop.create_task(self._sleep()),
+						self._loop.create_task(self._readmany()),
 					]
 				# the tasks can be cancelled, by this potion of code
 				# should finish before rebalancing in order to have a
@@ -429,37 +442,50 @@ class MergeManager:
 				try:
 					self._before_rebalancing = asyncio.Future(loop=self._loop)
 					# run the two tasks concurently, see who wins
-					done, self._pending_tasks = await asyncio.wait(self._pending_tasks,
+					done, self._pending_tasks = await asyncio.wait(
+							self._pending_tasks,
 							return_when=asyncio.FIRST_COMPLETED,
 							timeout=wait_timeout, loop=self._loop)
 					# execute the coroutine of the first done, cancel the other one
 					if done:
-						for task in self._pending_tasks:
-							task.cancel()
-							await task
+						if self._pending_tasks:
+							for task in self._pending_tasks: task.cancel()
+							await asyncio.wait(self._pending_tasks)
 						for task in done:
 							task = task.result()
 							# can be None if has been cancelled for rebalancing
-							if task: await task
+							if task: await asyncio.shield(task)
 						self._pending_tasks = ()
+						done = ()
 					# else, timed out for autocommit, execute it next turn
 				finally:
 					self._before_rebalancing.set_result(None)
 					self._before_rebalancing = None
 
-		except asyncio.CancelledError:
-			for task in self._pending_tasks:
-				task.cancel()
-				await task
+		except asyncio.CancelledError: pass
 		except Exception:
 			log.error("Unexpected error in merge routine", exc_info=True)
 			raise Errors.KafkaError("Unexpected error during merge")
+
+		pending = []
+		for task in self._pending_tasks:
+			if task.done():
+				task = task.result()
+				if task: pending.append(task)
+			else:
+				task.cancel()
+				pending.append(task)
+		for task in done:
+			task = task.result()
+			if task and not task.done(): pending.append(task)
+		# print ('self._merge_routine pending', pending, self._pending_tasks, done)
+		self._pending_tasks = pending
 
 	def build_processors(self):
 		"""
 		builds the processors and other data structures
 		"""
-		if self._closing.done(): return
+		if self._closed: return
 
 		self._wakeups = {}
 		self._offsets = {}
@@ -479,10 +505,12 @@ class MergeManager:
 		"""
 		cleans the processors and other data structures, do a last commit
 		"""
+		if self._closed: return
+
 		self._rebalancing = asyncio.Future(loop=loop)
-		for task in self._pending_tasks:
-			task.cancel()
-			await task
+		if self._pending_tasks:
+			for task in self._pending_tasks: task.cancel()
+			await asyncio.wait(self._pending_tasks)
 		if self._before_rebalancing:
 			await self._before_rebalancing
 		try: await self._maybe_do_last_autocommit()
@@ -508,17 +536,16 @@ class MergeManager:
 		interval = self._auto_commit_interval_ms / 1000
 		backoff = self._retry_backoff_ms / 1000
 		if now > self._next_autocommit_deadline:
-			if self._offsets:
-				try: await self._do_commit()
-				except Errors.KafkaError as error:
-					log.warning("Auto offset commit failed: %s", error)
-					if error.retriable:
-						# Retry after backoff.
-						self._next_autocommit_deadline = \
-							self._loop.time() + backoff
-						return backoff
-					else:
-						raise
+			try: await self._do_commit()
+			except Errors.KafkaError as error:
+				log.warning("Auto offset commit failed: %s", error)
+				if error.retriable:
+					# Retry after backoff.
+					self._next_autocommit_deadline = \
+						self._loop.time() + backoff
+					return backoff
+				else:
+					raise
 			# If we had an unrecoverable error we expect the user to handle it
 			# from another source (say Fetcher, like authorization errors).
 			self._next_autocommit_deadline = now + interval
@@ -530,7 +557,7 @@ class MergeManager:
 		Mostly inspired from GroupCoordinator
 		Does a last autocommit before closing / rebalancing
 		"""
-		if not self._enable_auto_commit or not self._offsets:
+		if not self._enable_auto_commit:
 			return
 		await self._do_commit()
 
@@ -545,14 +572,15 @@ class MergeManager:
 		offsets.update(self._offsets)
 		await self._consumer.commit(offsets)
 
-	async def run(self):
+	def run(self):
 		"""
 		Returns the main coroutine
 		"""
+		if self._closed:
+			raise Errors.ConsumerStoppedError()
 		if not self._merge_task:
-			self._merge_task = asyncio.ensure_future(
-					self._merge_routine(), loop=loop)
-		return await self._merge_task
+			self._merge_task = self._loop.create_task(self._merge_routine())
+		return self._merge_task
 
 
 class MergeConsumer(AIOKafkaConsumer):
@@ -602,8 +630,8 @@ class MergeConsumer(AIOKafkaConsumer):
 		await self._client.close()
 		log.debug("The KafkaConsumer has closed.")
 
-	async def run(self):
-		return await self._merge_manager.run()
+	def run(self):
+		return self._merge_manager.run()
 
 """
 Requirements:
@@ -632,6 +660,7 @@ if __name__ == "__main__":
 		for i in range(5000):
 			for topic in topics:
 				# data is topic-i-xxxxx...  in order to make long messages that needs to be polled in several requests
+				# time.sleep(0.001)
 				loop.run_until_complete(producer.send(topic, '-'.join((topic, str(i), 1000*'x')).encode('ascii')))
 		loop.run_until_complete(producer.stop())
 
@@ -643,9 +672,10 @@ if __name__ == "__main__":
 				return int(msg.value.decode('ascii').split('-')[1])
 
 			async def process(self, msg):
-				time.sleep(0.001) # slow down processing
+				# time.sleep(0.001) # slow down processing
+				await asyncio.sleep(0.001)
 				value = tuple(msg.value.decode('ascii').split('-')[:2])
-				# print ('process', msg.topic, msg.partition, msg.offset)
+				# print ('process', msg.topic, msg.partition, msg.offset, value)
 				results.setdefault(msg.partition, []).append(value)
 
 		for i in range(20):
@@ -654,14 +684,16 @@ if __name__ == "__main__":
 
 			if not i:
 				if len(sys.argv) < 2 or sys.argv[1] != 'slave':
-					# print ('=====', 'seek_to_beginning')
+					print ('=====', 'seek_to_beginning')
 					loop.run_until_complete(consumer.seek_to_beginning())
 
-			try: loop.run_until_complete(asyncio.shield(
-				asyncio.wait_for(consumer.run(), timeout=2 + 10 * random.random(), loop=loop)))
-			except asyncio.TimeoutError: pass
+			timeout = 2 + 10 * random.random()
+			print ('=====', 'run', timeout)
+			loop.run_until_complete(asyncio.wait((consumer.run(),),
+					timeout=2 + 10 * random.random(), loop=loop))
+			print ('=====', 'stop')
 			loop.run_until_complete(consumer.stop())
-			loop.run_until_complete(asyncio.gather(*asyncio.Task.all_tasks()))
+			loop.run_until_complete(asyncio.wait(asyncio.Task.all_tasks()))
 
 			print ('=====', 'results', sum(len(r) for r in results.values()))
 			# for i, r in results.items():
