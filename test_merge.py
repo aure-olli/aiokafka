@@ -335,14 +335,14 @@ class MergeManager:
 		"""`
 		The coroutine to execute once `_readmany` has won the race
 		"""
-		# await asyncio.wait([_readone_aux(msg) for msg in messages])
-		for msg in messages:
-			partition = msg.partition
-			tp = TopicPartition(msg.topic, partition)
-			self._offsets[tp] = msg.offset
-			self._pending_tp.remove(tp)
-			offsets, timestamp = await self._processors[partition].feed(msg)
-			self._update_partition(partition, offsets, timestamp)
+		await asyncio.wait([self._readone_aux(msg) for msg in messages])
+		# for msg in messages:
+		# 	partition = msg.partition
+		# 	tp = TopicPartition(msg.topic, partition)
+		# 	self._offsets[tp] = msg.offset
+		# 	self._pending_tp.remove(tp)
+		# 	offsets, timestamp = await self._processors[partition].feed(msg)
+		# 	self._update_partition(partition, offsets, timestamp)
 
 	async def _sleep(self):
 		"""
@@ -366,8 +366,11 @@ class MergeManager:
 					if tp.partition != partition: continue
 					state = assignment.state_value(tp)
 					offset = self._offsets.get(tp, state.position)
+					# if no highwater yet, wait for the first response
+					if state.highwater is None:
+						update = True
 					# if the partition is not consumed, cancel the wakeup
-					if state.highwater > offset:
+					elif state.highwater > offset:
 						self._wakeups.pop(partition)
 						break
 					# if the last partition highwater is too old,
@@ -381,7 +384,7 @@ class MergeManager:
 					# could be improved by waiting for fetcher
 					# `_proc_fetch_request`, but no such callback
 					if update:
-						timestamp += self._highwater_update_ms
+						timestamp = time.time() * 1000 + self._highwater_update_ms
 						# insert back this wakep in the list
 						# list iterator is only using index, so it's working
 						for j in range(i+1, len(wakeups)):
@@ -507,7 +510,7 @@ class MergeManager:
 		"""
 		if self._closed: return
 
-		self._rebalancing = asyncio.Future(loop=loop)
+		self._rebalancing = asyncio.Future(loop=self._loop)
 		if self._pending_tasks:
 			for task in self._pending_tasks: task.cancel()
 			await asyncio.wait(self._pending_tasks)
@@ -570,7 +573,7 @@ class MergeManager:
 		offsets = self._subscriptions.subscription \
 				.assignment.all_consumed_offsets()
 		offsets.update(self._offsets)
-		await self._consumer.commit(offsets)
+		if offsets: await self._consumer.commit(offsets)
 
 	def run(self):
 		"""
@@ -660,7 +663,7 @@ if __name__ == "__main__":
 		for i in range(5000):
 			for topic in topics:
 				# data is topic-i-xxxxx...  in order to make long messages that needs to be polled in several requests
-				# time.sleep(0.001)
+				# time.sleep(0.0001)
 				loop.run_until_complete(producer.send(topic, '-'.join((topic, str(i), 1000*'x')).encode('ascii')))
 		loop.run_until_complete(producer.stop())
 
