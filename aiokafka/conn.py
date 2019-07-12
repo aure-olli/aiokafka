@@ -371,7 +371,7 @@ class AIOKafkaConnection:
     def port(self):
         return self._port
 
-    def send(self, request, expect_response=True):
+    def send(self, request, expect_response=True, timeout=None):
         if self._writer is None:
             raise Errors.ConnectionError(
                 "No connection to broker at {0}:{1}"
@@ -398,7 +398,8 @@ class AIOKafkaConnection:
             return self._writer.drain()
         fut = create_future(loop=self._loop)
         self._requests.append((correlation_id, request.RESPONSE_TYPE, fut))
-        return asyncio.wait_for(fut, self._request_timeout, loop=self._loop)
+        return asyncio.wait_for(fut, timeout or self._request_timeout,
+            loop=self._loop)
 
     def _send_sasl_token(self, payload, expect_response=True):
         if self._writer is None:
