@@ -456,7 +456,8 @@ class AIOKafkaClient:
             return False
         return True
 
-    async def send(self, node_id, request, *, group=ConnectionGroup.DEFAULT):
+    async def send(self, node_id, request, *, group=ConnectionGroup.DEFAULT,
+        timeout=None):
         """Send a request to a specific node.
 
         Arguments:
@@ -484,7 +485,7 @@ class AIOKafkaClient:
             expect_response = False
 
         future = self._conns[(node_id, group)].send(
-            request, expect_response=expect_response)
+            request, expect_response=expect_response, timeout=timeout)
         try:
             result = await future
         except asyncio.TimeoutError:
