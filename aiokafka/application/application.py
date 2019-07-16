@@ -114,7 +114,6 @@ class TopicStream:
             self._after_reassignment()
         while True:
             done = await self._app.watch_reassignment()
-            print ('TopicStream', 'done', done)
             if done: self._after_reassignment()
             else: self._before_reassignment()
 
@@ -142,7 +141,7 @@ class TopicStream:
             task = self._loop.create_task(fun(*partitions, **kwargs))
             try:
                 done, _ = await asyncio.wait((coro, self._reassignment_start),
-                        loop=self._loop, return_when=FIRST_COMPLETED)
+                        loop=self._loop, return_when=asyncio.FIRST_COMPLETED)
             except asyncio.CancelledError:
                 assert not task.done()
                 task.cancel()
@@ -188,7 +187,6 @@ class PartitionStream:
     async def _watch_reassignment(self):
         while True:
             done = await self._app.watch_reassignment()
-            print ('PartitionStream', 'done', done)
             if done: continue
             self._assignment = None
             self._reassignment.set_result(None)
@@ -199,18 +197,16 @@ class PartitionStream:
         self._state = StreamState.READY
         if self._assignment is None:
             raise Exception('rebalanced')
-        print ('_get', fun, partitions)
         task = self._loop.create_task(fun(*partitions, **kwargs))
         try:
-            done, _ = await asyncio.wait((coro, self._reassignment),
-                    loop=self._loop, return_when=FIRST_COMPLETED)
-            print ('_get', 'done')
+            done, _ = await asyncio.wait((task, self._reassignment),
+                    loop=self._loop, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             assert not task.done()
             task.cancel()
             raise
         if task.done():
-            msg = await task.result()
+            msg = task.result()
             self._state = StreamState.PROCESSING
             return msg
         else:
@@ -218,7 +214,6 @@ class PartitionStream:
             raise Exception('rebalanced')
 
     async def getone(self, *partitions):
-        print ('getone')
         return await self._get(self._app.consumer.getone, partitions)
 
     async def getmany(self, *partitions, timeout_ms=0, max_records=None,
@@ -437,6 +432,9 @@ class _AIOKafkaConsumer(AIOKafkaConsumer):
                     # was called before `start`
                     await self._client.force_metadata_update()
                     self._coordinator.assign_all_partitions(check_unknown=True)
+
+    def create_poll_waiter(self):
+        return self._fetcher.create_poll_waiter()
 
 
 class Assignator:
@@ -740,7 +738,6 @@ class AIOKafkaApplication(object):
         tocreate = set()
         for topic in self._topics:
             partitions = self.client.cluster.partitions_for_topic(topic)
-            print ('partitions', topic, partitions)
             if partitions is None:
                 tocreate.add(topic)
             elif topic in self._topic_group:
@@ -749,7 +746,6 @@ class AIOKafkaApplication(object):
                     group_partitions[group] = partitions
                 elif group_partitions[group] != partitions:
                     raise RuntimeError('different partitions')
-        print ('tocreate', tocreate, self._topics)
         if not tocreate: return
         node_id = self.client.get_random_node()
 
@@ -769,10 +765,8 @@ class AIOKafkaApplication(object):
         else:
             request = CreateTopicsRequest[1](topics,
                     self._create_topic_timeout_ms, False)
-        print ('request', request)
         response = await self.client.send(node_id, request,
                 timeout=self._create_topic_timeout_ms / 1000)
-        print ('response', response)
 
         for topic, code, reason in response.topic_errors:
             if code != 0:
@@ -790,7 +784,6 @@ class AIOKafkaApplication(object):
             metadata_request = MetadataRequest[1]([])
         metadata = await self.client.send(node_id, metadata_request,
                 timeout=self._create_topic_timeout_ms / 1000)
-        print ('metadata', metadata)
         self.client.cluster.update_metadata(metadata)
 
         for topic in self._topics:
@@ -805,7 +798,6 @@ class AIOKafkaApplication(object):
                     raise RuntimeError('different partitions')
 
     async def watch_reassignment(self):
-        print ('watch_reassignment')
         return await asyncio.shield(self._reassignment)
 
     # Warn if producer was not closed properly
@@ -830,6 +822,24 @@ class AIOKafkaApplication(object):
 
     def partition_task(self, fun, *kargs, **kwargs):
         return PartitionTask(self, self._loop, fun, kargs, kwargs)
+
+    async def position(self, partition):
+        return await self.consumer.position(partition)
+
+    def highwater(self, partition):
+        return self.consumer.highwater(partition)
+
+    def last_stable_offset(self, partition):
+        return self.consumer.last_stable_offset(partition)
+
+    def last_poll_timestamp(self, partition):
+        return self.consumer.last_poll_timestamp(partition)
+
+    async def consumed(self, partition):
+        highwater = self.consumer.highwater(partition)
+        position = await self.consumer.position(partition)
+        return highwater is not None and position is not None and \
+                highwater <= position
 
     async def start(self):
         """Connect to Kafka cluster and check server version"""

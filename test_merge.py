@@ -239,7 +239,7 @@ class MergeConsumerRebalanceListener(ConsumerRebalanceListener):
 		if not self._consumer._merge_manager: return
 		await self._consumer._merge_manager.clean_processors()
 
-	async def on_partitions_assigned(self, revoked):
+	async def on_partitions_assigned(self, assigned):
 		if not self._consumer._merge_manager: return
 		self._consumer._merge_manager.build_processors()
 
@@ -397,7 +397,7 @@ class MergeManager:
 						return self._loop.create_task(
 								self._sleep_aux(partition))
 			# no wakeup left, just wait for cancel when `_readmany` will finish
-			while True: await asyncio.sleep(100)
+			await self._loop.create_future()
 		except asyncio.CancelledError: pass
 
 	async def _sleep_aux(self, partition):
@@ -660,11 +660,15 @@ if __name__ == "__main__":
 	if len(sys.argv) >= 2 and sys.argv[1] == 'fill':
 		producer = AIOKafkaProducer(loop=loop)
 		loop.run_until_complete(producer.start())
-		for i in range(5000):
-			for topic in topics:
-				# data is topic-i-xxxxx...  in order to make long messages that needs to be polled in several requests
-				# time.sleep(0.0001)
-				loop.run_until_complete(producer.send(topic, '-'.join((topic, str(i), 1000*'x')).encode('ascii')))
+		# for i in range(10):
+		# 	for topic in topics:
+		# 		# data is topic-i-xxxxx...  in order to make long messages that needs to be polled in several requests
+		# 		# time.sleep(0.0001)
+		# 		loop.run_until_complete(producer.send(topic, '-'.join((topic, str(i), 1000*'x')).encode('ascii')))
+		import random
+		for i in range(50):
+			topic = random.choice(topics)
+			loop.run_until_complete(producer.send(topic, '-'.join((topic, str(i), 1000*'x')).encode('ascii')))
 		loop.run_until_complete(producer.stop())
 
 	else:

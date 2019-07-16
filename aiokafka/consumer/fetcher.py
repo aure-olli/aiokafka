@@ -397,6 +397,7 @@ class Fetcher:
 
         self._wait_consume_future = None
         self._fetch_waiters = set()
+        self._poll_waiters = set()
 
         # SubscriptionState will pass Coordination critical errors to those
         # waiters directly
@@ -438,7 +439,7 @@ class Fetcher:
         if future is not None and not future.done():
             future.set_result(None)
 
-    def _create_fetch_waiter(self):
+    def create_fetch_waiter(self):
         # Creating a fetch waiter is usually not that frequent of an operation,
         # (get methods will return all data first, before a waiter is created)
 
@@ -446,6 +447,13 @@ class Fetcher:
         self._fetch_waiters.add(fut)
         fut.add_done_callback(
             lambda f, waiters=self._fetch_waiters: waiters.remove(f))
+        return fut
+
+    def create_poll_waiter(self):
+        fut = create_future(loop=self._loop)
+        self._poll_waiters.add(fut)
+        fut.add_done_callback(
+            lambda f, waiters=self._poll_waiters: waiters.remove(f))
         return fut
 
     @property
@@ -546,6 +554,10 @@ class Fetcher:
                             # we added some messages to self._records,
                             # wake up waiters
                             self._notify(waiter)
+                    for waiter in self._poll_waiters:
+                        # we added some messages to self._records,
+                        # wake up waiters
+                        self._notify(waiter)
                     self._pending_tasks -= done_pending
         except asyncio.CancelledError:
             pass
@@ -1042,7 +1054,7 @@ class Fetcher:
                     res_or_error.check_raise()
 
             # No messages ready. Wait for some to arrive
-            waiter = self._create_fetch_waiter()
+            waiter = self.create_fetch_waiter()
             await waiter
 
     async def fetched_records(self, partitions, timeout=0, max_records=None,
@@ -1096,7 +1108,7 @@ class Fetcher:
             if drained or not timeout:
                 return drained
 
-            waiter = self._create_fetch_waiter()
+            waiter = self.create_fetch_waiter()
             done, _ = await asyncio.wait(
                 [waiter], timeout=timeout, loop=self._loop)
 
