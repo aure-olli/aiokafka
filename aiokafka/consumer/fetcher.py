@@ -1068,6 +1068,13 @@ class Fetcher:
             if self._subscriptions.reassignment_in_progress:
                 await self._subscriptions.wait_for_assignment()
 
+            if isinstance(max_records_per_partition, dict):
+                mrpp_dict = max_records_per_partition
+                mrpp_dflt = None
+            else:
+                mrpp_dict = {}
+                mrpp_dflt = max_records_per_partition
+
             start_time = self._loop.time()
             drained = {}
             for tp in list(self._records.keys()):
@@ -1078,9 +1085,10 @@ class Fetcher:
                     continue
                 res_or_error = self._records[tp]
                 if type(res_or_error) == FetchResult:
-                    limit = max_records if max_records_per_partition is None \
-                        else max_records_per_partition if max_records is None \
-                        else min(max_records, max_records_per_partition)
+                    mrpp = mrpp_dict.get(mrpp_dflt)
+                    limit = max_records if mrpp is None \
+                            else mrpp if max_records is None \
+                            else min(max_records, mrpp)
                     records = res_or_error.getall(limit)
                     if not res_or_error.has_more():
                         # We processed all messages - request new ones

@@ -2,7 +2,7 @@ import asyncio
 import logging
 import collections
 import itertools
-from enum import Enum
+import enum
 import warnings
 
 from aiokafka.client import AIOKafkaClient
@@ -84,21 +84,25 @@ class Topic:
                 [], list(config.items()))
 
 
-class StreamState(Enum):
-    INIT = 1
-    READY = 2
-    WAITING = 3
-    PROCESSING = 4
-    STOPPED = 5
+class StreamState(enum.Enum):
+    INIT = enum.auto()
+    READ = enum.auto()
+    IDLE = enum.auto()
+    PROCESS = enum.auto()
+    CLOSED = enum.auto()
+    PAUSE = enum.auto()
+    JOIN = enum.auto()
+    COMMIT = enum.auto()
 
 
 class TopicStream:
 
-    def __init__(self, app, loop, topics):
+    def __init__(self, app, loop, topics, cache=0):
         self._app = app
         self._loop = loop
         self._state = StreamState.INIT
         self.topics = frozenset(topics)
+        self._cache = cache
         self._assignment = None
         self._reassignment_start = loop.create_future()
         self._reassignment_stop = loop.create_future()
@@ -148,7 +152,7 @@ class TopicStream:
                 raise
             if task.done():
                 msg = await task.result()
-                self._state = StreamState.PROCESSING
+                self._state = StreamState.PROCESS
                 return msg
             else:
                 task.cancel()
@@ -171,59 +175,238 @@ class TopicStream:
 
 class PartitionStream:
 
-    def __init__(self, app, loop, assignment):
+    def __init__(self, app, loop, assignment, cache=0):
         self._app = app
         self._loop = loop
         self._state = StreamState.INIT
         self._assignment = frozenset(assignment)
         self._reassignment = self._loop.create_future()
+        self._commit = self._loop.create_future()
         if not self._app.assigned:
             raise Exception('rebalanced')
         self._watcher = loop.create_task(self._watch_reassignment())
+        self._cache = cache
+        self._queues = collections.defaultdict(collections.deque)
+        self._fill_task = None
+        app.register_stream(self)
 
     def assignment(self):
         return self._assignment
+
+    async def init(self):
+        assert self._state is StreamState.INIT
+        self._fill_task = await self._fill_cache_task()
 
     async def _watch_reassignment(self):
         while True:
             done = await self._app.watch_reassignment()
             if done: continue
+            self._state = StreamState.CLOSED
             self._assignment = None
+            if self._fill_task:
+                self._fill_task.cancel()
+                self._fill_task = None
             self._reassignment.set_result(None)
-            return
-
-    async def _get(self, fun, partitions, **kwargs):
-        partitions = partitions or self._assignment
-        self._state = StreamState.READY
-        if self._assignment is None:
-            raise Exception('rebalanced')
-        task = self._loop.create_task(fun(*partitions, **kwargs))
-        try:
-            done, _ = await asyncio.wait((task, self._reassignment),
-                    loop=self._loop, return_when=asyncio.FIRST_COMPLETED)
-        except asyncio.CancelledError:
-            assert not task.done()
-            task.cancel()
-            raise
-        if task.done():
-            msg = task.result()
-            self._state = StreamState.PROCESSING
-            return msg
-        else:
-            task.cancel()
-            raise Exception('rebalanced')
-
-    async def getone(self, *partitions):
-        return await self._get(self._app.consumer.getone, partitions)
+            break
 
     async def getmany(self, *partitions, timeout_ms=0, max_records=None,
             max_records_per_partition=None):
-        return await self._get(self._app.consumer.getmany,
-                timeout_ms=timeout_ms, max_records=max_records,
-                max_records_per_partition=max_records_per_partition)
+        if not partitions: partitions = self._assignment
+        await self._get_read(partitions)
+        try:
+            # check in cache first
+            records = await self._get_many_from_cache(partitions,
+                    max_records, max_records_per_partition)
+            # else request data
+            if records is None or not records and timeout_ms > 0:
+                records = await self._get_or_fail(
+                        self._app.consumer.getmany, *partitions,
+                        timeout_ms=timeout_ms, max_records=max_records,
+                        max_records_per_partition=max_records_per_partition)
+            for tp, rec in records.items():
+                self._app._offsets[tp] = rec[-1].offset + 1
+        finally:
+            # refill the cache
+            if self._state is StreamState.READ:
+                self._state = StreamState.PROCESS
+                if await self._fill_cache_once():
+                    self._fill_task = asyncio.ensure_future(self._fill_cache())
+
+    async def getone(self, *partitions):
+        if not partitions: partitions = self._assignment
+        await self._get_read(partitions)
+        try:
+            # look for a message in cache first
+            msg = None
+            if self._queues:
+                for tp in partitions:
+                    queue = self._queues.get(tp)
+                    if queue:
+                        msg = queue.popleft()
+                        break
+            # else request data
+            if not msg:
+                msg = await self._get_or_fail(self._app.consumer.getone,
+                        *partitions)
+            tp = TopicPartition(msg.topic, msg.partition)
+            self._app._offsets[tp] = msg.offset + 1
+            return msg
+        finally:
+            # refill the cache
+            if self._state is StreamState.READ:
+                self._state = StreamState.PROCESS
+                if await self._fill_cache_once():
+                    self._fill_task = asyncio.ensure_future(self._fill_cache())
+
+    async def _get_read(self, partitions):
+        # check that the state allows reading
+        assert self._state in (StreamState.PROCESS, StreamState.JOIN,
+            StreamState.INIT, StreamState.IDLE, StreamState.PAUSE)
+        # if we try to read more from a partition, commit all its messages
+        for tp in partitions:
+            offset = self._app._offsets.get(tp)
+            if offset is not None:
+                self._app._commits[tp] = offset
+        # if join required, join now
+        while self._state is StreamState.JOIN:
+            if not await asyncio.shield(self._do_join()):
+                raise RuntimeError('rebalanced')
+            # should always be the case, but maybe could have 2 join in a row
+            if self._state is StreamState.COMMIT: break
+            elif self._state is StreamState.JOIN: continue
+            else: raise RuntimeError('state ??? ' + self._state.name)
+        # cancel the current fetching task
+        if self._fill_task:
+            self._fill_task.cancel()
+            self._fill_task = None
+        self._state = StreamState.READ
+
+    async def _do_join(self):
+        self._state = StreamState.COMMIT
+        commit = await self._app.join(self)
+        if not commit:
+            self._state = StreamState.CLOSED
+        return commit
+
+    async def _get_or_fail(self, fun, *kargs, **kwargs):
+        while True:
+            assert self._state is StreamState.READ
+            task = asyncio.ensure_future(fun(*kargs, **kwargs))
+            try:
+                await asyncio.wait((task, self._reassignment, self._commit),
+                        return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                assert not task.done()
+                task.cancel()
+                raise
+            if task.done():
+                return task.result()
+            else:
+                task.cancel()
+                if self._state is StreamState.JOIN:
+                    if not await asyncio.shield(self._do_join()):
+                        raise RuntimeError('rebalanced')
+                    if self._state is StreamState.COMMIT:
+                        self._state = StreamState.READ
+                if self._state is StreamState.CLOSED:
+                    raise RuntimeError('rebalanced')
+                if self._commit.done():
+                    self._commit = asyncio.Future()
+
+    async def join(self):
+        assert self._state is not StreamState.CLOSED
+        if self.status in (StreamState.INIT, StreamState.PAUSE):
+            state = self._state
+            self._state = StreamState.COMMIT
+            if self._fill_task:
+                self._fill_task.cancel()
+                self._fill_task = None
+            if await self._app.join(self):
+                self._state = state
+            else:
+                self._state = StreamState.CLOSED
+        elif self.status in (StreamState.READ, StreamState.PROCESS):
+            self._state = StreamState.JOIN
+            if StreamState.READ:
+                self._commit.set_result(None)
+
+    async def _get_many_from_cache(self, partitions, max_records,
+            max_records_per_partition):
+        if not self._queues: return None
+        # build the function get_limit for faster read of mrpp
+        if max_records_per_partition is None:
+            get_limit = lambda tp: float('inf')
+        elif isinstance(max_records_per_partition, dict):
+            def get_limit(tp):
+                limit = max_records_per_partition.get(tp)
+                return limit if limit is not None else float('inf')
+        else: get_limit = lambda tp: max_records_per_partition
+        if max_records is None: max_records = float('inf')
+        # all the matching records in cache
+        cached = {}
+        # the parameters for the next request
+        req_pts = set()
+        req_mrpp = {}
+        # check in cache
+        for tp in partitions:
+            limit = get_limit(tp)
+            if limit < 1: continue
+            queue = self._queues.get(tp, ())
+            count = min(limit, max_records, len(queue))
+            if count < 1:
+                req_pts.add(pt)
+                if limit != float('inf'):
+                    req_mrpp[tp] = limit - count
+                continue
+            cached[tp] = [queue.popleft() for _ in range(count)]
+            max_records_per_partition -= count
+            if max_records_per_partition < 1: return cached
+            if count < limit:
+                req_pts.add(pt)
+                if limit != float('inf'):
+                    req_mrpp[tp] = limit - count
+        # nothing in cache, return for a normal call
+        if not cached: return None
+        # or nothing to fetch more, return
+        if not req_pts: return cached
+        # call `getmany` without timeout to fill up the response
+        req_mr = max_records if max_records != float('inf') else None
+        for tp, records in await self._app.consumer.getmany(
+                self, *req_pts, max_records=req_mr,
+                max_records_per_partition=req_mrpp, timeout_ms=0):
+            previous = cached.setdefault(tp, records)
+            if previous is not records: previous.extend(records)
+        return cached
+
+    async def _fill_cache_task(self):
+        self._state = StreamState.PROCESS
+        if await self._fill_cache_once():
+            return asyncio.ensure_future(self._fill_cache())
+        return None
+
+    async def _fill_cache_once(self, timeout_ms=0):
+        if not self._cache: return False
+        # build request limits
+        req_pts = set()
+        req_mrpp = {}
+        for tp in self._assignment:
+            count = self._cache - len(self._queues.get(tp, ()))
+            if count < 1: continue
+            req_pts.add(tp)
+            req_mrpp[tp] = count
+        # cache is full, wait for next `get_many` call
+        if not req_pts: return False
+        results = await self._app.consumer.getmany(*req_pts,
+                timeout_ms=timeout_ms, max_records_per_partition=req_mrpp)
+        for tp, records in results.items():
+            self._queues[tp].extend(records)
+        return True
+
+    async def _fill_cache(self, timeout_ms=1000):
+        while await self._fill_cache_once(timeout_ms): pass
 
     async def __anext__(self):
-        return await self._get(self._app.consumer.getone, partitions)
+        return await self.getone()
 
     def __aiter__(self):
         return self
@@ -251,7 +434,6 @@ class PartitionTask:
             await self._after_reassignment()
         while True:
             done = await self._app.watch_reassignment()
-            print ('PartitionTask', 'done', done)
             if done: await self._after_reassignment()
             else: await self._before_reassignment()
 
@@ -278,7 +460,7 @@ class PartitionTask:
                     return arg
                 return PartitionStream(self._app, self._loop,
                         (tp for tp in arg.assignment()
-                            if tp.partition == partition))
+                            if tp.partition == partition), cache=arg._cache)
             kargs = [transform(arg) for arg in self._kargs]
             kwargs = {k: transform(arg) for k, arg in self._kwargs.items()}
             self._tasks.append(self._loop.create_task(
@@ -513,15 +695,22 @@ class RebalanceListener(ConsumerRebalanceListener):
 
     async def on_partitions_revoked(self, revoked):
         print ('on_partitions_revoked')
+        self._app.assigned = False
+        if self._app._auto_commit_task:
+            self._app._auto_commit_task.cancel()
+            self._app._auto_commit_task = None
         self._app._reassignment.set_result(False)
         self._app._reassignment = asyncio.Future()
-        self._app.assigned = False
+        await self._app.commit()
 
     async def on_partitions_assigned(self, assigned):
         print ('on_partitions_assigned')
+        self._app.assigned = True
         self._app._reassignment.set_result(True)
         self._app._reassignment = asyncio.Future()
-        self._app.assigned = True
+        if not self._app._auto_commit_task:
+            self._app._auto_commit_task = asyncio.ensure_future(
+                    self._app._do_auto_commit())
 
 
 class AIOKafkaApplication(object):
@@ -669,8 +858,8 @@ class AIOKafkaApplication(object):
             request_timeout_ms=request_timeout_ms,
             retry_backoff_ms=retry_backoff_ms,
             auto_offset_reset=auto_offset_reset,
-            enable_auto_commit=enable_auto_commit,
-            auto_commit_interval_ms=auto_commit_interval_ms,
+            enable_auto_commit=False,
+            # auto_commit_interval_ms=auto_commit_interval_ms,
             check_crcs=check_crcs,
             partition_assignment_strategy=partition_assignment_strategy,
             max_poll_interval_ms=max_poll_interval_ms,
@@ -683,15 +872,22 @@ class AIOKafkaApplication(object):
             exclude_internal_topics=exclude_internal_topics,
             isolation_level=isolation_level,
         )
+        self._enable_auto_commit = enable_auto_commit
+        self._auto_commit_interval_ms = auto_commit_interval_ms
 
         self._create_topic_timeout_ms = create_topic_timeout_ms
-
         self._topics = {}
         self._group_topics = [[]]
         self._topic_group = {True: 0}
         self._reassignment = loop.create_future()
-        self._reassignment = asyncio.Future()
         self.assigned = False
+        self._offsets = {}
+        self._commits = {}
+        self._streams = set()
+        self._joining = set()
+        self._committed = None
+        self._group_id = group_id
+        self._auto_commit_task = None
 
         self._loop = loop
         if loop.get_debug():
@@ -800,6 +996,50 @@ class AIOKafkaApplication(object):
     async def watch_reassignment(self):
         return await asyncio.shield(self._reassignment)
 
+    def register_stream(self, stream):
+        self._streams.add(stream)
+
+    async def join(self, stream):
+        self._joining.remove(stream)
+        if self._joining:
+            return await self._committed
+        # TODO commit
+        if self._group_id and self._commits:
+            if self._txn_manager:
+                await self.send_offsets_to_transaction(
+                        self._commits, self._group_id)
+            else:
+                await self.consumer.commit(self._offsets)
+        # TODO commit
+        await self.flush()
+        if self._txn_manager:
+            await self.commit_transaction()
+        if self.assigned:
+            if self._txn_manager:
+                await self.begin_transaction()
+            self._committed.set_result(True)
+            return True
+        else:
+            self._streams
+            self._committed.set_result(False)
+            return False
+
+    async def commit(self):
+        print ('commit !!!')
+        if self._committed:
+            return await self._committed
+        self._joining = self._streams
+        self._committed = asyncio.Future()
+        await asyncio.wait((stream.join() for stream in self._joining))
+        await self._committed
+        self._committed = None
+
+    async def _do_auto_commit(self):
+        if not self._enable_auto_commit or self.assigned: return
+        while True:
+            await asyncio.sleep(self.auto_commit_interval_ms)
+            await self.commit()
+
     # Warn if producer was not closed properly
     # We don't attempt to close the Consumer, as __del__ is synchronous
     def __del__(self, _warnings=warnings):
@@ -817,14 +1057,18 @@ class AIOKafkaApplication(object):
                 context['source_traceback'] = self._source_traceback
             self._loop.call_exception_handler(context)
 
-    def stream(self, *topics):
-        return TopicStream(self, self._loop, topics)
+    def stream(self, *topics, cache=0):
+        return TopicStream(self, self._loop, topics, cache=cache)
 
     def partition_task(self, fun, *kargs, **kwargs):
         return PartitionTask(self, self._loop, fun, kargs, kwargs)
 
     async def position(self, partition):
-        return await self.consumer.position(partition)
+        offset = self._offsets.get(partition)
+        if offset is None:
+            offset = await self.consumer.position(partition)
+            self._offsets[partition] = offset
+        return offset
 
     def highwater(self, partition):
         return self.consumer.highwater(partition)
@@ -837,7 +1081,7 @@ class AIOKafkaApplication(object):
 
     async def consumed(self, partition):
         highwater = self.consumer.highwater(partition)
-        position = await self.consumer.position(partition)
+        position = await self.position(partition)
         return highwater is not None and position is not None and \
                 highwater <= position
 
@@ -865,6 +1109,7 @@ class AIOKafkaApplication(object):
         log.debug("Kafka producer started")
 
         await self.consumer.start()
+        self._auto_commit_task = asyncio.ensure_future(self._do_auto_commit())
 
         print ('started')
         self.assigned = True

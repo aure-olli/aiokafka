@@ -666,7 +666,7 @@ if __name__ == "__main__":
 		# 		# time.sleep(0.0001)
 		# 		loop.run_until_complete(producer.send(topic, '-'.join((topic, str(i), 1000*'x')).encode('ascii')))
 		import random
-		for i in range(50):
+		for i in range(5000):
 			topic = random.choice(topics)
 			loop.run_until_complete(producer.send(topic, '-'.join((topic, str(i), 1000*'x')).encode('ascii')))
 		loop.run_until_complete(producer.stop())
@@ -712,8 +712,10 @@ if __name__ == "__main__":
 				for j, v in enumerate(r):
 					if v in index:
 						print ('=====', 'duplicate', i, v, index[v], j)
+						diff = True
 					index[v] = j
 					if j and int(v[1]) < prev:
 						print ('=====', 'unordered', i, prev, v, j-1, j)
+						diff = True
 					prev = int(v[1])
 			if diff or sum(len(r) for r in results.values()) >= 25000: break

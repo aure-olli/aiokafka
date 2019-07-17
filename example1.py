@@ -29,19 +29,20 @@ async def merge(input, keyvalue, latency=5000):
 			tp = TopicPartition(message.topic, message.partition)
 			pending.remove(tp)
 			messages[tp] = (*keyvalue(message), message)
-			print ('message', keyvalue(message))
+			# print ('message', keyvalue(message))
 			if oldest is None or message.timestamp < oldest.timestamp:
 				oldest = message
 			# no pending partition, send the oldest message
 			if not pending:
-				print ('not pending')
+				# print ('not pending')
 				minkey = min(k for k, _, _ in messages.values())
 				for tp, v in [(tp, v) for tp, (k, v, _) in messages.items()
 						if k <= minkey]:
 					del messages[tp]
 					pending.add(tp)
-					print ('value', v)
+					# print ('value', v)
 					allvalues[tp.partition].append(v)
+					time.sleep(0.01)
 				# get the new oldest
 				if messages:
 					oldest = min((m for _, _, m in messages.values()),
@@ -52,35 +53,36 @@ async def merge(input, keyvalue, latency=5000):
 
 		wait = None
 		while wait is None:
-			print ('oldest', oldest and oldest.timestamp)
+			# print ('oldest', oldest and oldest.timestamp)
 			# partitions are not consumed, so wait forever
 			if not oldest or not all(await asyncio.gather(
 					*(app.consumed(tp) for tp in pending))):
 				wait = asyncio.Future()
-				print ('Future')
+				# print ('Future')
 				break
 			diff = (oldest.timestamp + latency) / 1000 - time.time()
 			# the oldest message is not that old yet, wait for it to be older
 			if diff and diff > 0:
 				wait = asyncio.sleep(diff)
-				print ('sleep', diff)
+				# print ('sleep', diff)
 				break
 			# the last metadata are too old, wait for fresher metadata
 			last_poll = min(app.last_poll_timestamp(tp) for tp in pending)
 			if oldest.timestamp + latency > last_poll:
 				wait = app.consumer.create_poll_waiter()
-				print ('create_poll_waiter')
+				# print ('create_poll_waiter')
 				break
 			# Send all the messages which are too old,
 			# and the messages that should appear before them
-			print ('all consumed')
+			# print ('all consumed')
 			minkey = min(k for k, _, _ in messages.values())
 			for tp, v in [(tp, v) for tp, (k, v, _) in messages.items()
 					if k <= minkey]:
 				del messages[tp]
 				pending.add(tp)
-				print ('value', v)
+				# print ('value', v)
 				allvalues[tp.partition].append(v)
+				time.sleep(0.001)
 			# get the new oldest
 			if messages:
 				oldest = min((m for _, _, m in messages.values()),
@@ -89,24 +91,37 @@ async def merge(input, keyvalue, latency=5000):
 			# we don't know what to wait for next
 
 def keyvalue(message):
-	value = message.value.decode('ascii').split('-')[:2]
+	value = tuple(message.value.decode('ascii').split('-')[:2])
 	return (int(value[1]), value)
 
 task = app.partition_task(merge,
-	app.stream('test1', 'test2', 'test3', 'test4', 'test5'),
+	app.stream('test1', 'test2', 'test3', 'test4', 'test5', cache=1),
 	keyvalue=keyvalue)
 
-await app.start()
-# await app.consumer.seek_to_beginning()
-# await task.run()
-
-
-
-
 import asyncio
-await asyncio.sleep(100)
+
+async def run():
+	await app.start()
+	# await app.consumer.seek_to_beginning()
+	# await task.run()
+
+	await asyncio.sleep(20)
+
+asyncio.get_event_loop().run_until_complete(run())
 
 
 import asyncio
 for task in asyncio.Task.all_tasks():
 	if task.done(): task.result()
+
+# print (allvalues)
+for (i, r) in allvalues.items():
+	index = {}
+	prev = None
+	for j, v in enumerate(r):
+		if v in index:
+			print ('=====', 'duplicate', i, v, index[v], j)
+		index[v] = j
+		if j and int(v[1]) < prev:
+			print ('=====', 'unordered', i, prev, v, j-1, j)
+		prev = int(v[1])
