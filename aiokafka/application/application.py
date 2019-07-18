@@ -41,7 +41,7 @@ log = logging.getLogger(__name__)
 _missing = object()
 
 
-class Topic:
+class TopicConfig:
 
     CONFIG_NAMES = {
         'retention_ms': 'retention.ms',
@@ -49,8 +49,8 @@ class Topic:
     }
 
     def __init__(self, app, topic,
-            partitions=None,
-            replicas=None,
+            partitions,
+            replicas,
             compacting=None,
             deleting=None,
             retention_ms=None,
@@ -282,6 +282,7 @@ class PartitionStream:
         self._state = StreamState.READ
 
     async def _do_join(self):
+        print ('PartitionStream', '_do_join', self._state.name)
         self._state = StreamState.COMMIT
         commit = await self._app.join(self)
         if not commit:
@@ -310,25 +311,21 @@ class PartitionStream:
                         self._state = StreamState.READ
                 if self._state is StreamState.CLOSED:
                     raise RuntimeError('rebalanced')
-                if self._commit.done():
-                    self._commit = asyncio.Future()
 
     async def join(self):
-        assert self._state is not StreamState.CLOSED
-        if self.status in (StreamState.INIT, StreamState.PAUSE):
+        # assert self._state is not StreamState.CLOSED
+        print ('PartitionStream', 'join', self._state.name)
+        if self._state in (StreamState.INIT, StreamState.PAUSE):
             state = self._state
-            self._state = StreamState.COMMIT
-            if self._fill_task:
-                self._fill_task.cancel()
-                self._fill_task = None
-            if await self._app.join(self):
+            if await self._do_join():
+                assert self._state is StreamState.COMMIT
                 self._state = state
-            else:
-                self._state = StreamState.CLOSED
-        elif self.status in (StreamState.READ, StreamState.PROCESS):
+        elif self._state in (StreamState.READ, StreamState.PROCESS):
             self._state = StreamState.JOIN
             if StreamState.READ:
                 self._commit.set_result(None)
+                self._commit = asyncio.Future()
+        else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def _get_many_from_cache(self, partitions, max_records,
             max_records_per_partition):
@@ -424,7 +421,7 @@ class PartitionTask:
         for arg in itertools.chain(kargs, kwargs.values()):
             if isinstance(arg, TopicStream):
                 self._reassignable.append(arg)
-        self._watcher = loop.create_task(self._watch_reassignment())
+        self._watcher = None # loop.create_task(self._watch_reassignment())
         self._tasks = None
 
     async def _watch_reassignment(self):
@@ -437,14 +434,13 @@ class PartitionTask:
             if done: await self._after_reassignment()
             else: await self._before_reassignment()
 
-    async def _before_reassignment(self):
+    def _before_reassignment(self):
         if not self._tasks: return
         for task in self._tasks: self._task.cancel()
-        asyncio.wait(self._tasks)
         self._tasks = None
 
     async def _after_reassignment(self):
-        asyncio.wait([arg.wait_assigned() for arg in self._reassignable])
+        await asyncio.wait([arg.wait_assigned() for arg in self._reassignable])
         partitions = None
         for arg in self._reassignable:
             check = collections.defaultdict(set)
@@ -876,9 +872,9 @@ class AIOKafkaApplication(object):
         self._auto_commit_interval_ms = auto_commit_interval_ms
 
         self._create_topic_timeout_ms = create_topic_timeout_ms
-        self._topics = {}
-        self._group_topics = [[]]
-        self._topic_group = {True: 0}
+        self._subscriptions = set()
+        self._equipartitioned = list()
+        self._topic_configs = {}
         self._reassignment = loop.create_future()
         self.assigned = False
         self._offsets = {}
@@ -894,18 +890,22 @@ class AIOKafkaApplication(object):
             self._source_traceback = traceback.extract_stack(sys._getframe(1))
         self._closed = False
 
-    def topic(self, topic, group=None,
-              partitions=None,
-              replicas=None,
+    def ensure_topic(self, topic,
+              partitions,
+              replicas,
+              group=None,
+              **
               compacting=None,
               deleting=None,
               retention_ms=None,
               retention_bytes=None,
               config=None):
+        if group is not None and group != topic:
+            self._equipartitioned.append({topic, group})
         if group == topic: group = None
-        if topic in self._topics:
+        if topic in self._topic_configs:
             raise ValueError(f'topic {topic} already declared')
-        out = Topic(self, topic,
+        self._topic_configs[topic] = TopicConfig(self, topic,
             partitions=partitions,
             replicas=replicas,
             compacting=compacting,
@@ -913,20 +913,6 @@ class AIOKafkaApplication(object):
             retention_ms=retention_ms,
             retention_bytes=retention_bytes,
             config=config)
-        if group:
-            if group is not True and group not in self._topics:
-                raise ValueError(f'unknown group {group}')
-            elif group in self._topic_group:
-                index = self._topic_group[group]
-                self._topic_group[topic] = index
-                self._group_topics[index].append(topic)
-            else:
-                index = len(self._group_topics)
-                self._topic_group[group] = index
-                self._topic_group[topic] = index
-                self._group_topics.append([group, topic])
-        self._topics[topic] = out
-        return out
 
     async def check_topics(self):
         # TODO use `node_id = self.client.get_random_node()`
@@ -1000,6 +986,7 @@ class AIOKafkaApplication(object):
         self._streams.add(stream)
 
     async def join(self, stream):
+        print ('application', 'join', stream)
         self._joining.remove(stream)
         if self._joining:
             return await self._committed
@@ -1015,12 +1002,14 @@ class AIOKafkaApplication(object):
         if self._txn_manager:
             await self.commit_transaction()
         if self.assigned:
+            print ('application', 'join', 'self.assigned')
             if self._txn_manager:
                 await self.begin_transaction()
             self._committed.set_result(True)
             return True
         else:
-            self._streams
+            print ('application', 'join', 'not self.assigned')
+            self._streams.clear()
             self._committed.set_result(False)
             return False
 
@@ -1028,16 +1017,19 @@ class AIOKafkaApplication(object):
         print ('commit !!!')
         if self._committed:
             return await self._committed
-        self._joining = self._streams
+        if not self._streams: return
+        self._joining = set(self._streams)
         self._committed = asyncio.Future()
-        await asyncio.wait((stream.join() for stream in self._joining))
+        print ('joining', self._joining)
+        await asyncio.wait([stream.join() for stream in self._joining])
         await self._committed
         self._committed = None
 
     async def _do_auto_commit(self):
-        if not self._enable_auto_commit or self.assigned: return
+        print ('_do_auto_commit', self._enable_auto_commit, self.assigned)
+        if not self._enable_auto_commit or not self.assigned: return
         while True:
-            await asyncio.sleep(self.auto_commit_interval_ms)
+            await asyncio.sleep(self._auto_commit_interval_ms / 1000)
             await self.commit()
 
     # Warn if producer was not closed properly
@@ -1107,15 +1099,17 @@ class AIOKafkaApplication(object):
         self._message_accumulator.set_api_version(self.client.api_version)
         self._producer_magic = 0 if self.client.api_version < (0, 10) else 1
         log.debug("Kafka producer started")
+        if self._txn_manager:
+            await self.begin_transaction()
 
         await self.consumer.start()
-        self._auto_commit_task = asyncio.ensure_future(self._do_auto_commit())
 
         print ('started')
         self.assigned = True
         f = self._reassignment
         self._reassignment = asyncio.Future()
         f.set_result(True)
+        self._auto_commit_task = asyncio.ensure_future(self._do_auto_commit())
 
     async def flush(self):
         """Wait untill all batches are Delivered and futures resolved"""

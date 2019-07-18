@@ -104,7 +104,11 @@ async def run():
 	await app.start()
 	# await app.consumer.seek_to_beginning()
 	# await task.run()
-
+	async def print_allvalues():
+		while True:
+			await asyncio.sleep(1)
+			print ('allvalues', sum(len(r) for r in allvalues.values()))
+	asyncio.ensure_future(print_allvalues())
 	await asyncio.sleep(20)
 
 asyncio.get_event_loop().run_until_complete(run())
@@ -115,6 +119,7 @@ for task in asyncio.Task.all_tasks():
 	if task.done(): task.result()
 
 # print (allvalues)
+print (sum(len(r) for r in allvalues.values()))
 for (i, r) in allvalues.items():
 	index = {}
 	prev = None
