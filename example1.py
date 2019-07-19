@@ -8,8 +8,8 @@ from aiokafka.structs import TopicPartition
 
 app = AIOKafkaApplication(loop=loop)
 
-for topic in ('test1', 'test2', 'test3', 'test4', 'test5'):
-	app.topic(topic, 'test1')
+# for topic in ('test1', 'test2', 'test3', 'test4', 'test5'):
+# 	app.topic(topic, 'test1')
 
 allvalues = collections.defaultdict(list)
 
@@ -95,15 +95,15 @@ def keyvalue(message):
 	return (int(value[1]), value)
 
 task = app.partition_task(merge,
-	app.stream('test1', 'test2', 'test3', 'test4', 'test5', cache=1),
+	app.partitionable_consumer('test1', 'test2', 'test3', 'test4', 'test5', cache=1),
 	keyvalue=keyvalue)
 
 import asyncio
 
 async def run():
 	await app.start()
-	# await app.consumer.seek_to_beginning()
-	# await task.run()
+	await app.consumer.seek_to_beginning()
+	await task.start()
 	async def print_allvalues():
 		while True:
 			await asyncio.sleep(1)
