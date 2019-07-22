@@ -138,7 +138,6 @@ class PartitionTask:
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def before_commit(self):
-        print ('before_commit')
         # already committing, nothing to do
         if self._state in (TaskState.COMMIT, TaskState.REBALANCE):
             return
@@ -157,6 +156,8 @@ class PartitionTask:
             # join all the partition arguments
             self._state = TaskState.JOIN
             async def aux(pargs):
+                if not pargs:
+                    return
                 tasks = [asyncio.ensure_future(arg.before_commit())
                         for arg in pargs]
                 try:
@@ -185,7 +186,6 @@ class PartitionTask:
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def after_commit(self):
-        print ('after_commit')
         # not started yet, don't start anything
         if self._state is TaskState.INIT:
             return
@@ -203,7 +203,6 @@ class PartitionTask:
     async def start(self):
         self._app.register_task(self)
         # ready to start
-        print ('task', 'task', self._state)
         if self._state is TaskState.INIT:
             if self._app.ready:
                 self._task = asyncio.ensure_future(self._run())
@@ -233,7 +232,8 @@ class PartitionTask:
         self._state = TaskState.CLOSED
         # cancel the task
         if self._task and not self._task.done():
-            await asyncio.wait([await self._task])
+            self._task.cancel()
+            await asyncio.wait([self._task])
 
     async def _run(self):
         """The main coroutine"""
@@ -248,7 +248,6 @@ class PartitionTask:
             else:
                 assert partitions == set(p)
         assert partitions is not None
-        print ('partitions', partitions)
         if not partitions: return
         # build the arguments
         args = {}
@@ -286,7 +285,6 @@ class PartitionTask:
             if tasks:
                 for task in tasks:
                     if not task.done(): task.cancel()
-                await asyncio.gather(*tasks, return_exception=True)
+                await asyncio.wait(tasks)
             if pargs:
-                await asyncio.gather(*(arg.stop() for arg in pargs),
-                        return_exception=True)
+                await asyncio.wait([arg.stop() for arg in pargs])

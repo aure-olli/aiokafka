@@ -205,6 +205,7 @@ class GroupCoordinator(BaseCoordinator):
                  retry_backoff_ms=100,
                  enable_auto_commit=True, auto_commit_interval_ms=5000,
                  assignors=(RoundRobinPartitionAssignor,),
+                 consumer_protocol=ConsumerProtocol,
                  exclude_internal_topics=True,
                  max_poll_interval_ms=300000,
                  rebalance_timeout_ms=30000
@@ -226,6 +227,7 @@ class GroupCoordinator(BaseCoordinator):
         self._rebalance_timeout_ms = rebalance_timeout_ms
         self._retry_backoff_ms = retry_backoff_ms
         self._assignors = assignors
+        self.consumer_protocol = consumer_protocol
         self._enable_auto_commit = enable_auto_commit
         self._auto_commit_interval_ms = auto_commit_interval_ms
 
@@ -396,7 +398,8 @@ class GroupCoordinator(BaseCoordinator):
         member_metadata = {}
         all_subscribed_topics = set()
         for member_id, metadata_bytes in members:
-            metadata = ConsumerProtocol.METADATA.decode(metadata_bytes)
+            print ('METADATA', self.consumer_protocol, self.consumer_protocol.METADATA)
+            metadata = self.consumer_protocol.METADATA.decode(metadata_bytes)
             member_metadata[member_id] = metadata
             all_subscribed_topics.update(metadata.subscription)
 
@@ -435,7 +438,7 @@ class GroupCoordinator(BaseCoordinator):
         assignor = self._lookup_assignor(protocol)
         assert assignor, 'invalid assignment protocol: %s' % protocol
 
-        assignment = ConsumerProtocol.ASSIGNMENT.decode(
+        assignment = self.consumer_protocol.ASSIGNMENT.decode(
             member_assignment_bytes)
 
         # update partition assignment
@@ -1195,7 +1198,7 @@ class CoordinatorGroupRebalance:
                 self.group_id,
                 self._session_timeout_ms,
                 self._coordinator.member_id,
-                ConsumerProtocol.PROTOCOL_TYPE,
+                self._coordinator.consumer_protocol.PROTOCOL_TYPE,
                 metadata_list)
         elif self._api_version < (0, 11, 0):
             request = JoinGroupRequest[1](
@@ -1203,7 +1206,7 @@ class CoordinatorGroupRebalance:
                 self._session_timeout_ms,
                 self._rebalance_timeout_ms,
                 self._coordinator.member_id,
-                ConsumerProtocol.PROTOCOL_TYPE,
+                self._coordinator.consumer_protocol.PROTOCOL_TYPE,
                 metadata_list)
         else:
             request = JoinGroupRequest[2](
@@ -1211,7 +1214,7 @@ class CoordinatorGroupRebalance:
                 self._session_timeout_ms,
                 self._rebalance_timeout_ms,
                 self._coordinator.member_id,
-                ConsumerProtocol.PROTOCOL_TYPE,
+                self._coordinator.consumer_protocol.PROTOCOL_TYPE,
                 metadata_list)
 
         # create the request for the coordinator
@@ -1316,6 +1319,8 @@ class CoordinatorGroupRebalance:
                     response.group_protocol,
                     response.members)
         except Exception as e:
+            log.error(
+                "Unexpected error on group assignment", exc_info=True)
             raise Errors.KafkaError(repr(e))
 
         assignment_req = []

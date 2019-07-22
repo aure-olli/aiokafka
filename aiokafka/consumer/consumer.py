@@ -6,6 +6,7 @@ import traceback
 import warnings
 
 from kafka.coordinator.assignors.roundrobin import RoundRobinPartitionAssignor
+from kafka.coordinator.protocol import ConsumerProtocol
 
 from aiokafka.abc import ConsumerRebalanceListener
 from aiokafka.client import AIOKafkaClient
@@ -230,6 +231,7 @@ class AIOKafkaConsumer(object):
                  check_crcs=True,
                  metadata_max_age_ms=5 * 60 * 1000,
                  partition_assignment_strategy=(RoundRobinPartitionAssignor,),
+                 consumer_protocol=ConsumerProtocol,
                  max_poll_interval_ms=300000,
                  rebalance_timeout_ms=None,
                  session_timeout_ms=10000,
@@ -284,6 +286,7 @@ class AIOKafkaConsumer(object):
         self._enable_auto_commit = enable_auto_commit
         self._auto_commit_interval_ms = auto_commit_interval_ms
         self._partition_assignment_strategy = partition_assignment_strategy
+        self._consumer_protocol = consumer_protocol
         self._key_deserializer = key_deserializer
         self._value_deserializer = value_deserializer
         self._fetch_min_bytes = fetch_min_bytes
@@ -374,6 +377,7 @@ class AIOKafkaConsumer(object):
                 enable_auto_commit=self._enable_auto_commit,
                 auto_commit_interval_ms=self._auto_commit_interval_ms,
                 assignors=self._partition_assignment_strategy,
+                consumer_protocol=self._consumer_protocol,
                 exclude_internal_topics=self._exclude_internal_topics,
                 rebalance_timeout_ms=self._rebalance_timeout_ms,
                 max_poll_interval_ms=self._max_poll_interval_ms
@@ -1155,7 +1159,7 @@ class AIOKafkaConsumer(object):
         # Raise coordination errors if any
         self._coordinator.check_errors()
 
-        timeout = timeout_ms / 1000
+        timeout = timeout_ms and timeout_ms / 1000
         with self._subscription.fetch_context():
             records = await self._fetcher.fetched_records(
                 partitions, timeout,

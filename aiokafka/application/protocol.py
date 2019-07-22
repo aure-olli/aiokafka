@@ -1,7 +1,9 @@
 from kafka.protocol.api import Request, Response
+from kafka.protocol.struct import Struct
 from kafka.protocol.types import (
     Int16, Int32, Int64, Schema, String, Array, Boolean
 )
+from kafka.common import TopicPartition
 
 
 class CreateTopicsResponse_v0(Response):
@@ -74,3 +76,37 @@ class CreateTopicsRequest_v1(Request):
 
 CreateTopicsRequest = [CreateTopicsRequest_v0, CreateTopicsRequest_v1]
 CreateTopicsResponse = [CreateTopicsResponse_v0, CreateTopicsRequest_v1]
+
+
+class ApplicationConsumerProtocolMetadata(Struct):
+    SCHEMA = Schema(
+        ('version', Int16),
+        ('groups', Array(
+            Array(String('utf-8'))
+        )))
+
+    @property
+    def subscription(self):
+        return [topic for group in self.groups for topic in group]
+
+
+
+class ApplicationConsumerProtocolAssignment(Struct):
+    SCHEMA = Schema(
+        ('version', Int16),
+        ('assignment', Array(
+            ('topic', String('utf-8')),
+            ('partitions', Array(Int32))
+        )))
+
+    def partitions(self):
+        return [TopicPartition(topic, partition)
+                for topic, partitions in self.assignment # pylint: disable-msg=no-member
+                for partition in partitions]
+
+
+class ApplicationConsumerProtocol(object):
+    PROTOCOL_TYPE = 'application'
+    ASSIGNMENT_STRATEGIES = ('application')
+    METADATA = ApplicationConsumerProtocolMetadata
+    ASSIGNMENT = ApplicationConsumerProtocolAssignment

@@ -1061,74 +1061,79 @@ class Fetcher:
             max_records_per_partition=None):
         """ Returns previously fetched records and updates consumed offsets.
         """
+        start_time = self._loop.time()
+
+        if isinstance(max_records_per_partition, dict):
+            mrpp_dict = max_records_per_partition
+            mrpp_dflt = None
+        else:
+            mrpp_dict = {}
+            mrpp_dflt = max_records_per_partition
+
         while True:
+
             # While the background routine will fetch new records up till new
             # assignment is finished, we don't want to return records, that may
             # not belong to this instance after rebalance.
-            if self._subscriptions.reassignment_in_progress:
-                await self._subscriptions.wait_for_assignment()
+            reassignment = self._subscriptions.reassignment_in_progress
 
-            if isinstance(max_records_per_partition, dict):
-                mrpp_dict = max_records_per_partition
-                mrpp_dflt = None
-            else:
-                mrpp_dict = {}
-                mrpp_dflt = max_records_per_partition
-
-            start_time = self._loop.time()
-            drained = {}
-            for tp in list(self._records.keys()):
-                if partitions and tp not in partitions:
-                    # Cleanup results for unassigned partitons
-                    if not self._subscriptions.is_assigned(tp):
-                        del self._records[tp]
-                    continue
-                res_or_error = self._records[tp]
-                if type(res_or_error) == FetchResult:
-                    mrpp = mrpp_dict.get(mrpp_dflt)
-                    limit = max_records if mrpp is None \
-                            else mrpp if max_records is None \
-                            else min(max_records, mrpp)
-                    records = res_or_error.getall(limit)
-                    if not res_or_error.has_more():
-                        # We processed all messages - request new ones
-                        del self._records[tp]
-                        self._notify(self._wait_consume_future)
-                    if not records:
+            if not reassignment:
+                drained = {}
+                for tp in list(self._records.keys()):
+                    if partitions and tp not in partitions:
+                        # Cleanup results for unassigned partitons
+                        if not self._subscriptions.is_assigned(tp):
+                            del self._records[tp]
                         continue
-                    drained[tp] = records
-                    if max_records is not None:
-                        max_records -= len(drained[tp])
-                        assert max_records >= 0  # Just in case
-                        if max_records == 0:
-                            break
-                else:
-                    # We already got some messages from another partition -
-                    # return them. We will raise this error on next call
-                    if drained:
-                        return drained
+                    res_or_error = self._records[tp]
+                    if type(res_or_error) == FetchResult:
+                        mrpp = mrpp_dict.get(tp, mrpp_dflt)
+                        limit = max_records if mrpp is None \
+                                else mrpp if max_records is None \
+                                else min(max_records, mrpp)
+                        records = res_or_error.getall(limit)
+                        if not res_or_error.has_more():
+                            # We processed all messages - request new ones
+                            del self._records[tp]
+                            self._notify(self._wait_consume_future)
+                        if not records:
+                            continue
+                        drained[tp] = records
+                        if max_records is not None:
+                            max_records -= len(drained[tp])
+                            assert max_records >= 0  # Just in case
+                            if max_records == 0:
+                                break
                     else:
-                        # Remove error, so we can fetch on partition again
-                        del self._records[tp]
-                        self._notify(self._wait_consume_future)
-                        res_or_error.check_raise()
+                        # We already got some messages from another partition -
+                        # return them. We will raise this error on next call
+                        if drained:
+                            return drained
+                        else:
+                            # Remove error, so we can fetch on partition again
+                            del self._records[tp]
+                            self._notify(self._wait_consume_future)
+                            res_or_error.check_raise()
+                if drained:
+                    return drained
 
-            if drained or not timeout:
-                return drained
+                create_waiter = self.create_fetch_waiter
 
-            waiter = self.create_fetch_waiter()
-            done, _ = await asyncio.wait(
-                [waiter], timeout=timeout, loop=self._loop)
-
-            if not done or self._closed:
+            elapsed = self._loop.time() - start_time
+            if timeout is not None and timeout <= elapsed:
                 return {}
 
-            if waiter.done():
-                waiter.result()  # Check for authorization errors
+            if reassignment:
+                waiter = self._subscriptions.wait_for_assignment()
+            else:
+                waiter = self.create_fetch_waiter()
+            await asyncio.wait([waiter],
+                timeout=timeout and (elapsed - timeout), loop=self._loop)
 
-            # Decrease timeout accordingly
-            timeout = timeout - (self._loop.time() - start_time)
-            timeout = max(0, timeout)
+            if not waiter.done() or self._closed:
+                return {}
+
+            waiter.result()  # Check for authorization errors
 
     async def get_offsets_by_times(self, timestamps, timeout_ms):
         offsets = await self._retrieve_offsets(timestamps, timeout_ms)

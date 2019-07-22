@@ -7,7 +7,8 @@ import warnings
 
 from aiokafka.client import AIOKafkaClient
 from aiokafka.consumer import AIOKafkaConsumer
-from .protocol import CreateTopicsRequest
+from .protocol import (
+    CreateTopicsRequest, ApplicationConsumerProtocolMetadata, ApplicationConsumerProtocolAssignment, ApplicationConsumerProtocol)
 from kafka.protocol.metadata import MetadataRequest
 from kafka.common import TopicPartition
 from kafka.coordinator.protocol import (
@@ -103,6 +104,7 @@ class _AIOKafkaConsumer(AIOKafkaConsumer):
                  auto_commit_interval_ms=5000,
                  check_crcs=True,
                  partition_assignment_strategy=(),
+                 consumer_protocol=None,
                  max_poll_interval_ms=300000,
                  rebalance_timeout_ms=None,
                  session_timeout_ms=10000,
@@ -135,6 +137,7 @@ class _AIOKafkaConsumer(AIOKafkaConsumer):
         self._enable_auto_commit = enable_auto_commit
         self._auto_commit_interval_ms = auto_commit_interval_ms
         self._partition_assignment_strategy = partition_assignment_strategy
+        self._consumer_protocol = consumer_protocol
         self._key_deserializer = None
         self._value_deserializer = None
         self._fetch_min_bytes = fetch_min_bytes
@@ -204,6 +207,7 @@ class _AIOKafkaConsumer(AIOKafkaConsumer):
                 enable_auto_commit=self._enable_auto_commit,
                 auto_commit_interval_ms=self._auto_commit_interval_ms,
                 assignors=self._partition_assignment_strategy,
+                consumer_protocol=self._consumer_protocol,
                 exclude_internal_topics=self._exclude_internal_topics,
                 rebalance_timeout_ms=self._rebalance_timeout_ms,
                 max_poll_interval_ms=self._max_poll_interval_ms
@@ -245,61 +249,61 @@ class Assignator:
     def __init__(self, app):
         self._app = app
 
+    def groups(self, topics):
+        groups = collections.defaultdict(list)
+        for topic in topics:
+            groups[self._app._topic_group.get(topic, topic)].append(topic)
+        for group in groups.values():
+            group.sort()
+        return sorted(groups.values())
+
     def assign(self, cluster, member_metadata):
-
-        all_topics = None
+        print ('assignator assign')
+        groups = None
         for metadata in member_metadata.values():
-            if all_topics is None:
-                all_topics = set(metadata.subscription)
-            elif all_topics != set(metadata.subscription):
-                diff = all_topics.symmetric_difference(metadata.subscription)
-                raise UnmergeableTopcis(
-                        'Topic(s) %s do not appear in all members',
-                        ', '.join(diff))
-
-        group_topics = collections.defaultdict(list)
-        for topic in all_topics:
-            group_topics[self._app._topic_group.get(topic, topic)]\
-                    .append(topic)
+            if groups is None:
+                groups = metadata.groups
+            else:
+                assert groups == metadata.groups
 
         assignment = collections.defaultdict(lambda: collections.defaultdict(list))
         member_iter = itertools.cycle(sorted(member_metadata.keys()))
 
-        for group in group_topics.values():
+        for group in groups:
             all_partitions = None
-            for topic in all_topics:
+            for topic in group:
                 partitions = cluster.partitions_for_topic(topic)
                 if partitions is None:
-                    raise UnmergeableTopcis(
+                    raise RuntimeError(
                             'No partition metadata for topic %s', topic)
                 if all_partitions is None:
                     all_partitions = set(partitions)
                 elif all_partitions != set(partitions):
                     diff = all_partitions.symmetric_difference(partitions)
-                    raise UnmergeableTopcis(
+                    raise RuntimeError(
                             'Partition(s) %s do not appear in all topics',
                             ', '.join(str(p) for p in diff))
             all_partitions = sorted(all_partitions)
 
             for partition in all_partitions:
                 member_id = next(member_iter)
-                for topic in all_topics:
+                for topic in group:
                     assignment[member_id][topic].append(partition)
 
         protocol_assignment = {}
         for member_id in member_metadata:
-            protocol_assignment[member_id] = ConsumerProtocolMemberAssignment(
-                cls.version,
-                sorted(assignment[member_id].items()),
-                b'')
+            protocol_assignment[member_id] = \
+                ApplicationConsumerProtocolAssignment(
+                    self.version,
+                    sorted(assignment[member_id].items()))
         return protocol_assignment
 
-    @classmethod
-    def metadata(cls, topics):
-        return ConsumerProtocolMemberMetadata(cls.version, list(topics), b'')
+    def metadata(self, topics):
+        return ApplicationConsumerProtocolMetadata(
+                self.version, self.groups(topics))
 
-    @classmethod
-    def on_assignment(cls, assignment):
+    def on_assignment(self, assignment):
+        print ('assignator on_assignment', assignment)
         pass
 
 
@@ -313,11 +317,11 @@ class RebalanceListener(ConsumerRebalanceListener):
 
     async def on_partitions_revoked(self, revoked):
         print ('on_partitions_revoked')
-        await self._app.before_rebalance
+        await self._app.before_rebalance(revoked)
 
     async def on_partitions_assigned(self, assigned):
         print ('on_partitions_assigned')
-        await self._app.after_rebalance
+        await self._app.after_rebalance(assigned)
 
 
 class AIOKafkaApplication(object):
@@ -359,6 +363,7 @@ class AIOKafkaApplication(object):
             check_crcs=True,
             metadata_max_age_ms=5 * 60 * 1000,
             partition_assignment_strategy=None,
+            consumer_protocol=ApplicationConsumerProtocol,
             max_poll_interval_ms=300000,
             rebalance_timeout_ms=None,
             session_timeout_ms=10000,
@@ -469,6 +474,7 @@ class AIOKafkaApplication(object):
             # auto_commit_interval_ms=auto_commit_interval_ms,
             check_crcs=check_crcs,
             partition_assignment_strategy=partition_assignment_strategy,
+            consumer_protocol=consumer_protocol,
             max_poll_interval_ms=max_poll_interval_ms,
             rebalance_timeout_ms=rebalance_timeout_ms,
             session_timeout_ms=session_timeout_ms,
@@ -486,6 +492,7 @@ class AIOKafkaApplication(object):
         self._subscriptions = set()
         self._equipartitioned = list()
         self._topic_configs = {}
+        self._topic_group = None
         self.assigned = False
         self.ready = False
         self._offsets = {}
@@ -551,22 +558,24 @@ class AIOKafkaApplication(object):
             equipartitioned[topic] = group
         equipartitioned = [group for group in
                 equipartitioned.values() if isinstance(group, set)]
-        topic_groups = {}
+        topic_group = {}
         for i, group in enumerate(equipartitioned):
-            topic_groups.update((topic, i) for topic in group)
+            topic_group.update((topic, i) for topic in group)
         group_partitions = [None for _ in equipartitioned]
+        self._topic_group = topic_group
+        self._equipartitioned = equipartitioned
 
         all_topics = set(self._topic_configs)
         all_topics.update(self._subscriptions)
-        all_topics.update(topic_groups)
+        all_topics.update(topic_group)
 
         tocreate = set()
         for topic in all_topics:
             partitions = self.client.cluster.partitions_for_topic(topic)
             if partitions is None:
                 tocreate.add(topic)
-            elif topic in topic_groups:
-                index = topic_groups[topic]
+            elif topic in topic_group:
+                index = topic_group[topic]
                 pts = group_partitions[index]
                 if pts is None:
                     group_partitions[index] = partitions
@@ -582,8 +591,8 @@ class AIOKafkaApplication(object):
         topics = []
         for topic in tocreate:
             partitions = None
-            if topic in self._topic_group:
-                partitions = group_partitions[self._topic_group[topic]]
+            if topic in topic_group:
+                partitions = group_partitions[topic_group[topic]]
                 if partitions is not None:
                     assert partitions == set(range(len(partitions)))
                     partitions = len(partitions)
@@ -620,8 +629,8 @@ class AIOKafkaApplication(object):
             partitions = self.client.cluster.partitions_for_topic(topic)
             if partitions is None:
                 raise RuntimeError(f'No topic {topic}')
-            elif topic in self._topic_group:
-                group = self._topic_group[topic]
+            elif topic in topic_group:
+                group = topic_group[topic]
                 if group_partitions[group] is None:
                     group_partitions[group] = partitions
                 elif group_partitions[group] != partitions:
@@ -629,6 +638,9 @@ class AIOKafkaApplication(object):
 
     def register_task(self, stream):
         self._tasks.add(stream)
+
+    def unregister_task(self, stream):
+        self._tasks.remove(stream)
 
     def group(self, *topics):
         if len(topics) > 1:
@@ -650,27 +662,36 @@ class AIOKafkaApplication(object):
         return PartitionableProducer(self, topics)
 
     async def commit(self):
+        print ('app commit')
         if not self.assigned: raise Exception('rebalancing')
         if not self._commit_task:
             self._commit_task = asyncio.ensure_future(self._do_commit())
         await asyncio.shield(self._commit_task)
 
-    async def before_rebalance(self):
+    async def before_rebalance(self, revoked):
+        print ('app before_rebalance')
         self.assigned = False
-        if self._app._auto_commit_task:
-            self._app._auto_commit_task.cancel()
-            self._app._auto_commit_task = None
+        if self._auto_commit_task:
+            self._auto_commit_task.cancel()
+            self._auto_commit_task = None
         if not self._join_task:
             self._join_task = asyncio.ensure_future(self._do_join())
-        await asyncio.shield(self._join_task)
+        if self._tasks:
+            await asyncio.wait([self._join_task] +
+                    [task.before_rebalance(revoked) for task in self._tasks])
+        self._offsets.clear()
+        self._commits.clear()
 
-    async def after_rebalance(self):
+    async def after_rebalance(self, assigned):
+        print ('app after_rebalance')
         self.assigned = True
         self.ready = True
-        await asyncio.wait([task.after_commit() for task in self._tasks])
-        if not self._app._auto_commit_task:
-            self._app._auto_commit_task = asyncio.ensure_future(
-                    self._app._do_auto_commit())
+        if self._tasks:
+            await asyncio.wait([
+                    task.after_rebalance(assigned) for task in self._tasks])
+        if not self._auto_commit_task:
+            self._auto_commit_task = asyncio.ensure_future(
+                    self._do_auto_commit())
 
     async def _do_join(self):
         try:
@@ -682,7 +703,7 @@ class AIOKafkaApplication(object):
                     await self.send_offsets_to_transaction(
                             self._commits, self._group_id)
                 else:
-                    await self.consumer.commit(self._offsets)
+                    await self.consumer.commit(self._commits)
             await self.flush()
             if self._txn_manager:
                 await self.commit_transaction()
@@ -696,15 +717,17 @@ class AIOKafkaApplication(object):
                 self._join_task = asyncio.ensure_future(self._do_join())
             await asyncio.shield(self._join_task)
             if not self.assigned: raise Exception('rebalancing')
+            if self._closed: raise Exception('closed')
             if self._txn_manager:
                 await self.begin_transaction()
             self.ready = True
-            await asyncio.wait([task.after_commit() for task in self._tasks])
+            if self._tasks:
+                await asyncio.wait([
+                        task.after_commit() for task in self._tasks])
         finally:
             self._commit_task = None
 
     async def _do_auto_commit(self):
-        print ('_do_auto_commit', self._enable_auto_commit, self.assigned)
         if not self._enable_auto_commit or not self.assigned: return
         while True:
             await asyncio.sleep(self._auto_commit_interval_ms / 1000)
@@ -750,6 +773,7 @@ class AIOKafkaApplication(object):
                 highwater <= position
 
     async def start(self):
+        print ('app start')
         """Connect to Kafka cluster and check server version"""
         log.debug("Starting the Kafka producer")  # trace
         await self.client.bootstrap()
@@ -776,10 +800,11 @@ class AIOKafkaApplication(object):
 
         await self.consumer.start()
 
-        print ('started')
         self.assigned = True
         self.ready = True
-        self._auto_commit_task = asyncio.ensure_future(self._do_auto_commit())
+        if not self._auto_commit_task:
+            self._auto_commit_task = asyncio.ensure_future(
+                    self._do_auto_commit())
 
     async def flush(self):
         """Wait untill all batches are Delivered and futures resolved"""
@@ -790,8 +815,16 @@ class AIOKafkaApplication(object):
         if self._closed:
             return
         self._closed = True
+        if self._auto_commit_task:
+            self._auto_commit_task.cancel()
+            self._auto_commit_task = None
+        if not self._join_task:
+            self._join_task = asyncio.ensure_future(self._do_join())
+        await asyncio.shield(self._join_task)
+        if self._tasks:
+            await asyncio.wait([task.stop() for task in self._tasks])
 
-        await self.consumer.close()
+        await self.consumer.stop()
 
         # If the sender task is down there is no way for accumulator to flush
         if self._sender is not None and self._sender.sender_task is not None:

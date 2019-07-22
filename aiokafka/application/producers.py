@@ -50,6 +50,10 @@ class PartitionProducer(PartitionArgument):
         return set(TopicPartition(topic, self._partition)
                 for topic in self._topics)
 
+    @property
+    def partition(self):
+        return self._partition
+
     async def before_commit(self):
         # already committing, nothing to do
         if self._state in (ProducerState.COMMIT, ProducerState.CLOSED):

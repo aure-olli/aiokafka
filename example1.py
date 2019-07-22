@@ -6,7 +6,7 @@ loop = asyncio.get_event_loop()
 from aiokafka.application import AIOKafkaApplication
 from aiokafka.structs import TopicPartition
 
-app = AIOKafkaApplication(loop=loop)
+app = AIOKafkaApplication(loop=loop, auto_offset_reset='earliest', group_id='test')
 
 # for topic in ('test1', 'test2', 'test3', 'test4', 'test5'):
 # 	app.topic(topic, 'test1')
@@ -21,18 +21,19 @@ async def merge(input, keyvalue, latency=5000):
 	wait = asyncio.Future()
 	while True:
 		# fetch data of pending partitions
-		task = asyncio.ensure_future(input.getone(*pending))
+		task = asyncio.ensure_future(input.getmany(*pending,
+				max_records_per_partition=1, timeout_ms=None))
 		await asyncio.wait((task, wait), return_when=asyncio.FIRST_COMPLETED)
 		# a new message arrived
 		if task.done():
-			message = task.result()
-			tp = TopicPartition(message.topic, message.partition)
-			pending.remove(tp)
-			messages[tp] = (*keyvalue(message), message)
-			# print ('message', keyvalue(message))
-			if oldest is None or message.timestamp < oldest.timestamp:
-				oldest = message
-			# no pending partition, send the oldest message
+			for message in (msg for l in task.result().values() for msg in l):
+				tp = TopicPartition(message.topic, message.partition)
+				pending.remove(tp)
+				messages[tp] = (*keyvalue(message), message)
+				# print ('message', keyvalue(message))
+				if oldest is None or message.timestamp < oldest.timestamp:
+					oldest = message
+				# no pending partition, send the oldest message
 			if not pending:
 				# print ('not pending')
 				minkey = min(k for k, _, _ in messages.values())
@@ -42,7 +43,7 @@ async def merge(input, keyvalue, latency=5000):
 					pending.add(tp)
 					# print ('value', v)
 					allvalues[tp.partition].append(v)
-					time.sleep(0.002)
+					time.sleep(0.001)
 				# get the new oldest
 				if messages:
 					oldest = min((m for _, _, m in messages.values()),
@@ -82,7 +83,7 @@ async def merge(input, keyvalue, latency=5000):
 				pending.add(tp)
 				# print ('value', v)
 				allvalues[tp.partition].append(v)
-				time.sleep(0.002)
+				time.sleep(0.001)
 			# get the new oldest
 			if messages:
 				oldest = min((m for _, _, m in messages.values()),
@@ -102,31 +103,39 @@ import asyncio
 
 async def run():
 	await app.start()
-	print ('seek_to_beginning', await app.consumer.seek_to_beginning())
-	print ('seek_to_beginning', await app.consumer.seek_to_beginning())
-	print ([await app.position(tp) for tp in app.consumer.assignment()])
+	# print ('seek_to_beginning', await app.consumer.seek_to_beginning())
+	# print ('seek_to_beginning', await app.consumer.seek_to_beginning())
+	# print ([await app.position(tp) for tp in app.consumer.assignment()])
 	await task.start()
 	async def print_allvalues():
 		while True:
 			await asyncio.sleep(1)
 			print ('allvalues', sum(len(r) for r in allvalues.values()))
-	asyncio.ensure_future(print_allvalues())
+	pav = asyncio.ensure_future(print_allvalues())
 	await asyncio.sleep(20)
+	pav.cancel()
+	await app.stop()
 
 asyncio.get_event_loop().run_until_complete(run())
 
 
 import asyncio
 import traceback
+unfinished = []
 for task in asyncio.Task.all_tasks():
 	if task.done():
 		try: task.result()
+		except asyncio.CancelledError: pass
 		except:
 			print (task)
 			traceback.print_exc()
+	else:
+		unfinished.append(task)
+		print (task)
 
 # print (allvalues)
 print (sum(len(r) for r in allvalues.values()))
+print ([(p, len(r)) for p, r in allvalues.items()])
 for (i, r) in allvalues.items():
 	index = {}
 	prev = None

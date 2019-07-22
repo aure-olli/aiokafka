@@ -87,26 +87,26 @@ class PartitionConsumer(PartitionArgument):
         self._join = asyncio.Future()
         self._closed = asyncio.Future()
 
-    async def close(self):
+    async def stop(self):
         # already closed
         if self._state is ConsumerState.CLOSED: return
         self._state = ConsumerState.CLOSED
         # clean everything that could take space
         self._assignment = None
-        self.self._queues = None
+        self._queues = None
         # stop the filling task if any
         if self._fill_task:
             self._fill_task.cancel()
             self._fill_task = None
-        # wake up everybody to acknowledge the new state
+        # cancel everything
         if self._join:
-            self._join.set_result(None)
+            self._join.cancel()
             self._join = None
         if self._commit:
-            self._commit.set_result(None)
+            self._commit.cancel()
             self._commit = None
         if self._ready:
-            self._ready.set_result(None)
+            self._ready.cancel()
             self._ready = None
 
     @property
@@ -116,6 +116,13 @@ class PartitionConsumer(PartitionArgument):
     @property
     def assignment(self):
         return self._assignment
+
+    @property
+    def partition(self):
+        if not self._assignment:
+            return None
+        for tp in self._assignment:
+            return tp.partition
 
     async def before_commit(self):
         # already committing, nothing to do
@@ -216,6 +223,7 @@ class PartitionConsumer(PartitionArgument):
             # update offsets
             for tp, rec in records.items():
                 self._app._offsets[tp] = rec[-1].offset + 1
+            return records
         finally:
             # refill the cache (this part is not asynchronous)
             if self._state is ConsumerState.READ:
@@ -359,7 +367,7 @@ class PartitionConsumer(PartitionArgument):
             queue = self._queues.get(tp, ())
             count = min(limit, max_records, len(queue))
             if count < 1:
-                req_pts.add(pt)
+                req_pts.add(tp)
                 if limit != float('inf'):
                     req_mrpp[tp] = limit - count
                 continue
@@ -367,7 +375,7 @@ class PartitionConsumer(PartitionArgument):
             max_records_per_partition -= count
             if max_records_per_partition < 1: return cached
             if count < limit:
-                req_pts.add(pt)
+                req_pts.add(tp)
                 if limit != float('inf'):
                     req_mrpp[tp] = limit - count
         # nothing in cache, return for a normal call
