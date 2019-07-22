@@ -1,9 +1,12 @@
 import asyncio
 import enum
+import logging
 
 from kafka.common import TopicPartition
 
 from .tasks import Partitionable, PartitionArgument
+
+log = logging.getLogger(__name__)
 
 
 class ProducerState(enum.Enum):

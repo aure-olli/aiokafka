@@ -2,11 +2,13 @@ import abc
 import asyncio
 import enum
 import itertools
+import logging
+
+log = logging.getLogger(__name__)
 
 
 class TaskState(enum.Enum):
     INIT = enum.auto()
-    UNREADY = enum.auto()
     WAIT = enum.auto()
     PROCESS = enum.auto()
     CLOSED = enum.auto()
@@ -92,7 +94,7 @@ class PartitionTask:
 
     def __init__(self, app, fun, kargs, kwargs):
         self._app = app
-        self._state = TaskState.INIT if app.ready else TaskState.UNREADY
+        self._state = TaskState.INIT
         self._fun = fun
         self._kargs = kargs
         self._kwargs = kwargs
@@ -112,11 +114,8 @@ class PartitionTask:
     async def before_rebalance(self, revoked):
         # commit if not already done
         await self.before_commit()
-        # not started yet, nothing to do
-        if self._state is TaskState.UNREADY:
-            return
         # already rebalancing
-        elif self._state is TaskState.REBALANCE:
+        if self._state is TaskState.REBALANCE:
             return
         # stop the task
         elif self._state is TaskState.COMMIT:
@@ -130,8 +129,8 @@ class PartitionTask:
 
     async def after_rebalance(self, assigned):
         # not started yet, don't start anything
-        if self._state in (TaskState.INIT, TaskState.UNREADY):
-            self._state = TaskState.INIT
+        if self._state is TaskState.INIT:
+            return
         # start the task over
         elif self._state in (TaskState.WAIT, TaskState.REBALANCE):
             self._state = TaskState.PROCESS
@@ -139,12 +138,12 @@ class PartitionTask:
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def before_commit(self):
+        print ('before_commit')
         # already committing, nothing to do
         if self._state in (TaskState.COMMIT, TaskState.REBALANCE):
             return
         # not started yet, tag it unready to start
-        elif self._state in (TaskState.INIT, TaskState.UNREADY):
-            self._state = TaskState.UNREADY
+        elif self._state is TaskState.INIT:
             return
         # already joining, just wait for it to finish
         elif self._state is TaskState.JOIN:
@@ -158,9 +157,10 @@ class PartitionTask:
             # join all the partition arguments
             self._state = TaskState.JOIN
             async def aux(pargs):
-                tasks = [arg.before_commit() for arg in pargs]
+                tasks = [asyncio.ensure_future(arg.before_commit())
+                        for arg in pargs]
                 try:
-                    await asyncio.gather(tasks)
+                    await asyncio.gather(*tasks)
                     self._state = TaskState.COMMIT
                     self._commit = None
                 # joining went wrong, stop everything
@@ -185,9 +185,10 @@ class PartitionTask:
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def after_commit(self):
+        print ('after_commit')
         # not started yet, don't start anything
-        if self._state in (TaskState.INIT, TaskState.UNREADY):
-            self._state = TaskState.INIT
+        if self._state is TaskState.INIT:
+            return
         # waiting for commit to start, start it noe
         elif self._state is TaskState.WAIT:
             self._state = TaskState.PROCESS
@@ -196,7 +197,7 @@ class PartitionTask:
         elif self._state is TaskState.COMMIT:
             if self._pargs:
                 self._state = TaskState.PROCESS
-                await self.gather([arg.after_commit() for arg in self._pargs])
+                await asyncio.gather(*(arg.after_commit() for arg in self._pargs))
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def start(self):
@@ -204,17 +205,17 @@ class PartitionTask:
         # ready to start
         print ('task', 'task', self._state)
         if self._state is TaskState.INIT:
-            self._task = asyncio.ensure_future(self._run())
-            self._state = TaskState.PROCESS
+            if self._app.ready:
+                self._task = asyncio.ensure_future(self._run())
+                self._state = TaskState.PROCESS
+            else:
+                self._state = TaskState.WAIT
         # in the middle of a commit or a rebalance, start after it finished
-        elif self._state is TaskState.UNREADY:
-            self._state = TaskState.WAIT
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def stop(self):
         # already closed or not even started
-        if self._state in (
-                TaskState.INIT, TaskState.UNREADY, TaskState.CLOSED):
+        if self._state in (TaskState.INIT, TaskState.CLOSED):
             self._state = TaskState.CLOSED
             return
 
@@ -256,24 +257,24 @@ class PartitionTask:
             def transform(arg):
                 if isinstance(arg, Partitionable):
                     arg = arg.partitionate(partition)
-                    if insinstance(arg):
-                        pargs.append(arg, PartitionArgument)
+                    if isinstance(arg, PartitionArgument):
+                        pargs.append(arg)
                 return arg
             kargs = [transform(arg) for arg in self._kargs]
             kwargs = {k: transform(arg) for k, arg in self._kwargs.items()}
-            args.append((kargs, kwargs))
+            args[partition] = (kargs, kwargs)
         # start the partition arguments and then the tasks
         self._pargs = pargs
         tasks = ()
         try:
             if pargs:
-                tasks = [arg.start() for arg in pargs]
-                await self.gather(tasks)
+                tasks = [asyncio.ensure_future(arg.start()) for arg in pargs]
+                await asyncio.gather(*tasks)
 
             # TODO : stop  pargs of a task once finished
             tasks = [asyncio.ensure_future(self._fun(*kargs, **kwargs))
                     for kargs, kwargs in args.values()]
-            await self.gather(tasks)
+            await asyncio.gather(*tasks)
         # cancel everything and close the partition arguments
         except asyncio.CancelledError:
             raise
@@ -285,7 +286,7 @@ class PartitionTask:
             if tasks:
                 for task in tasks:
                     if not task.done(): task.cancel()
-                await self.gather(tasks, return_exception=True)
+                await asyncio.gather(*tasks, return_exception=True)
             if pargs:
-                await self.gather([arg.stop() for arg in pargs],
+                await asyncio.gather(*(arg.stop() for arg in pargs),
                         return_exception=True)

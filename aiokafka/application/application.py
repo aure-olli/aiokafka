@@ -675,7 +675,8 @@ class AIOKafkaApplication(object):
     async def _do_join(self):
         try:
             if self._tasks:
-                await asyncio.wait([task.before_commit() for task in self._tasks])
+                await asyncio.gather(*(task.before_commit()
+                        for task in self._tasks))
             if self._group_id and self._commits:
                 if self._txn_manager:
                     await self.send_offsets_to_transaction(

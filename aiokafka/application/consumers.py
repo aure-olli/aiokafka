@@ -1,10 +1,13 @@
 import asyncio
 import enum
 import collections
+import logging
 
 from kafka.common import TopicPartition
 
 from .tasks import Partitionable, PartitionArgument
+
+log = logging.getLogger(__name__)
 
 
 class ConsumerState(enum.Enum):
@@ -25,6 +28,7 @@ class PartitionableConsumer(Partitionable):
     def __init__(self, app, topics, cache=0):
         self._app = app
         self._topics = frozenset(topics)
+        self._assignment = None
         self._cache = cache
 
     @property
@@ -50,7 +54,7 @@ class PartitionableConsumer(Partitionable):
         assert set(partitions) == self._topics
         _, out = partitions.popitem()
         for pts in partitions.values():
-            assert tps == out
+            assert pts == out
         return out
 
     def partitionate(self, partition):
@@ -69,6 +73,7 @@ class PartitionConsumer(PartitionArgument):
         self._assignment = frozenset(partitions)
         self._cache = cache
         # all the dequeues of each each partition
+        self._state = ConsumerState.INIT
         self._queues = (collections.defaultdict(collections.deque)
                 if cache else None)
         self._fill_task = None # the task to fill the cache when not reading
@@ -130,6 +135,8 @@ class PartitionConsumer(PartitionArgument):
             # safest assumption
             self._commit_state = ConsumerState.PROCESS
             self._state = ConsumerState.JOIN
+            if not self._commit:
+                self._commit = asyncio.Future()
             await asyncio.shield(self._commit)
             assert self._state in (ConsumerState.COMMIT, ConsumerState.CLOSED)
         else: raise RuntimeError('state ??? ' + self._state.name)
@@ -217,7 +224,6 @@ class PartitionConsumer(PartitionArgument):
                     self._fill_task = asyncio.ensure_future(self._fill_cache())
 
     async def getone(self, *partitions):
-        print ('getone', partitions)
         if not partitions: partitions = self._assignment
         await self._get_read(partitions)
         try:
@@ -258,7 +264,8 @@ class PartitionConsumer(PartitionArgument):
         if self._state in (ConsumerState.JOIN, ConsumerState.COMMIT):
             await self._do_join()
         # the only states allowed before reading
-        assert self._state in (self.INIT, self.IDLE, self.PROCESS)
+        assert self._state in (
+                ConsumerState.INIT, ConsumerState.IDLE, ConsumerState.PROCESS)
         # cancel the current fetching task
         if self._fill_task:
             self._fill_task.cancel()

@@ -14,9 +14,9 @@ app = AIOKafkaApplication(loop=loop)
 allvalues = collections.defaultdict(list)
 
 async def merge(input, keyvalue, latency=5000):
-	print ('merge', input, input.assignment())
+	print ('merge', input, input.assignment)
 	messages = {}
-	pending = set(input.assignment())
+	pending = set(input.assignment)
 	oldest = None
 	wait = asyncio.Future()
 	while True:
@@ -42,7 +42,7 @@ async def merge(input, keyvalue, latency=5000):
 					pending.add(tp)
 					# print ('value', v)
 					allvalues[tp.partition].append(v)
-					time.sleep(0.01)
+					time.sleep(0.002)
 				# get the new oldest
 				if messages:
 					oldest = min((m for _, _, m in messages.values()),
@@ -82,7 +82,7 @@ async def merge(input, keyvalue, latency=5000):
 				pending.add(tp)
 				# print ('value', v)
 				allvalues[tp.partition].append(v)
-				time.sleep(0.001)
+				time.sleep(0.002)
 			# get the new oldest
 			if messages:
 				oldest = min((m for _, _, m in messages.values()),
@@ -102,7 +102,9 @@ import asyncio
 
 async def run():
 	await app.start()
-	await app.consumer.seek_to_beginning()
+	print ('seek_to_beginning', await app.consumer.seek_to_beginning())
+	print ('seek_to_beginning', await app.consumer.seek_to_beginning())
+	print ([await app.position(tp) for tp in app.consumer.assignment()])
 	await task.start()
 	async def print_allvalues():
 		while True:
@@ -115,8 +117,13 @@ asyncio.get_event_loop().run_until_complete(run())
 
 
 import asyncio
+import traceback
 for task in asyncio.Task.all_tasks():
-	if task.done(): task.result()
+	if task.done():
+		try: task.result()
+		except:
+			print (task)
+			traceback.print_exc()
 
 # print (allvalues)
 print (sum(len(r) for r in allvalues.values()))
