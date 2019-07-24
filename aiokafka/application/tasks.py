@@ -17,6 +17,27 @@ class TaskState(enum.Enum):
     REBALANCE = enum.auto()
 
 
+class AbstractTask(abc.ABC):
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def before_rebalance(self, revoked):
+        pass
+
+    async def after_rebalance(self, assigned):
+        pass
+
+    async def before_commit(self):
+        pass
+
+    async def after_commit(self):
+        pass
+
+
 class Partitionable(abc.ABC):
     """
     The ABC of all the arguments of `PartitionTask` that can be partitioned
@@ -50,7 +71,7 @@ class _GetPartition(Partitionable):
     """
 
     def partitionate(self, partition):
-        return partititon
+        return partition
 
 get_parition = _GetPartition()
 
@@ -80,6 +101,13 @@ class PartitionArgument(abc.ABC):
         """
         pass
 
+    async def during_commit(self):
+        """
+        Called before starting the commit
+        Must wait until the commit is ready or raise if impossible
+        """
+        pass
+
     async def after_commit(self):
         """
         Called when the commit has happened and the task can be resumed
@@ -87,7 +115,7 @@ class PartitionArgument(abc.ABC):
         pass
 
 
-class PartitionTask:
+class PartitionTask(AbstractTask):
     """
     A task that will run a function for each partition available
     """
@@ -112,6 +140,7 @@ class PartitionTask:
             app.group(*group)
 
     async def before_rebalance(self, revoked):
+        print ('task before_rebalance')
         # commit if not already done
         await self.before_commit()
         # already rebalancing
@@ -128,6 +157,7 @@ class PartitionTask:
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def after_rebalance(self, assigned):
+        print ('task after_rebalance')
         # not started yet, don't start anything
         if self._state is TaskState.INIT:
             return
@@ -138,6 +168,7 @@ class PartitionTask:
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def before_commit(self):
+        print ('task before_commit')
         # already committing, nothing to do
         if self._state in (TaskState.COMMIT, TaskState.REBALANCE):
             return
@@ -158,9 +189,13 @@ class PartitionTask:
             async def aux(pargs):
                 if not pargs:
                     return
-                tasks = [asyncio.ensure_future(arg.before_commit())
-                        for arg in pargs]
+                tasks = ()
                 try:
+                    tasks = [asyncio.ensure_future(arg.before_commit())
+                            for arg in pargs]
+                    await asyncio.gather(*tasks)
+                    tasks = [asyncio.ensure_future(arg.during_commit())
+                            for arg in pargs]
                     await asyncio.gather(*tasks)
                     self._state = TaskState.COMMIT
                     self._commit = None
@@ -186,6 +221,7 @@ class PartitionTask:
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def after_commit(self):
+        print ('task after_commit')
         # not started yet, don't start anything
         if self._state is TaskState.INIT:
             return
@@ -201,6 +237,7 @@ class PartitionTask:
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def start(self):
+        print ('task start')
         self._app.register_task(self)
         # ready to start
         if self._state is TaskState.INIT:

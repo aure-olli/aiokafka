@@ -35,6 +35,7 @@ class PartitionableProducer(Partitionable):
 class PartitionProducer(PartitionArgument):
 
     def __init__(self, app, topics, partition):
+        self._app = app
         self._topics = frozenset(topics)
         self._partition = partition
         self._state = ProducerState.INIT
@@ -54,26 +55,27 @@ class PartitionProducer(PartitionArgument):
     def partition(self):
         return self._partition
 
-    async def before_commit(self):
+    async def during_commit(self):
         # already committing, nothing to do
         if self._state in (ProducerState.COMMIT, ProducerState.CLOSED):
             return
         # The stream is not busy, can commit now
-        elif self._state in (ConsumerState.INIT, ConsumerState.IDLE):
-            self._state = ConsumerState.COMMIT
+        elif self._state in (ProducerState.INIT, ProducerState.IDLE):
+            self._state = ProducerState.COMMIT
         # The stream is sending, wait for all the `send` calls to finish
-        elif self._state in (ConsumerState.SEND, ConsumerState.JOIN):
-            if self._sending:
-                self._state = ConsumerState.JOIN
-                await asyncio.wait(self._sending)
-                assert not self._sending and self._state is ConsumerState.JOIN
-            self._state = ConsumerState.COMMIT
-        else: raise RuntimeError('state ??? ' + self._state.name)
+        # elif self._state in (ProducerState.SEND, ProducerState.JOIN):
+        #     if self._sending:
+        #         self._state = ProducerState.JOIN
+        #         await asyncio.wait(self._sending)
+        #         assert not self._sending and self._state is ProducerState.JOIN
+        #     self._state = ProducerState.COMMIT
+        else:
+            raise RuntimeError('state ??? ' + self._state.name)
 
     async def after_commit(self):
-        if self._state is ConsumerState.CLOSED: return
-        elif self._state is ConsumerState.COMMIT:
-            self._state = ConsumerState.IDLE
+        if self._state is ProducerState.CLOSED: return
+        elif self._state is ProducerState.COMMIT:
+            self._state = ProducerState.IDLE
             # notify ready for sending
             if self._ready:
                 self._ready.set_result(None)
@@ -82,6 +84,7 @@ class PartitionProducer(PartitionArgument):
 
     async def send(self, topic=None, value=None, key=None, partition=None,
             timestamp_ms=None, headers=None):
+        # print ('send', value)
         topic, partition = await self._get_send(topic, partition)
         try:
             future = asyncio.Future()
@@ -124,6 +127,7 @@ class PartitionProducer(PartitionArgument):
         assert partition is None or partition == self._partition
         # wait for commit to finish
         while self._state in (ProducerState.JOIN, ProducerState.COMMIT):
+            print ('!!! send during commit')
             if not self._ready:
                 self._ready = asyncio.Future()
             await asyncio.shield(self._ready)

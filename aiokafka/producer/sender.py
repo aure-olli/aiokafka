@@ -665,7 +665,8 @@ class EndTxnHandler(BaseHandler):
 
         return self._default_backoff
 
-
+import re
+PATTERN = re.compile(b'test[0-9]-[0-9]+')
 class SendProduceReqHandler(BaseHandler):
 
     def __init__(self, sender, batches):
@@ -677,6 +678,7 @@ class SendProduceReqHandler(BaseHandler):
     def create_request(self):
         topics = collections.defaultdict(list)
         for tp, batch in self._batches.items():
+            # print ('produce', PATTERN.findall(batch.get_data_buffer()))
             topics[tp.topic].append(
                 (tp.partition, batch.get_data_buffer())
             )

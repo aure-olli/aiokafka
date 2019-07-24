@@ -28,7 +28,6 @@ class PartitionableConsumer(Partitionable):
     def __init__(self, app, topics, cache=0):
         self._app = app
         self._topics = frozenset(topics)
-        self._assignment = None
         self._cache = cache
 
     @property
@@ -37,14 +36,9 @@ class PartitionableConsumer(Partitionable):
 
     @property
     def assignment(self):
-        if self._assignment is None:
-            self._assignment = frozenset(tp
-                    for tp in self._app.consumer.assignment()
-                    if tp.topic in self.topics)
-        return self._assignment
-
-    async def before_rebalance(self, revoked):
-        self._assignment = None
+        return frozenset(tp
+                for tp in self._app.consumer.assignment()
+                if tp.topic in self.topics)
 
     def partitions(self):
         partitions = collections.defaultdict(set)
@@ -76,6 +70,7 @@ class PartitionConsumer(PartitionArgument):
         self._state = ConsumerState.INIT
         self._queues = (collections.defaultdict(collections.deque)
                 if cache else None)
+        self._offsets = {} # the offset after the last fetched message
         self._fill_task = None # the task to fill the cache when not reading
         self._join = None # notify it to interrupt read and start to join
         self._commit = None # notify it when ready to commit
@@ -165,20 +160,31 @@ class PartitionConsumer(PartitionArgument):
         """
         # wasn't particularly busy, just change the state
         if self._state in (ConsumerState.INIT, ConsumerState.IDLE,
-                ConsumerState.PROCESS):
-            self._state = ConsumerState.IDLE
-            # ensure that the filling task is runing
-            if not self._fill_task:
-                if await self._fill_cache_once():
-                    self._fill_task = asyncio.ensure_future(self._fill_cache())
+                ConsumerState.PROCESS, ConsumerState.READ):
+            pass
+            # # self._state = ConsumerState.IDLE
+            # # ensure that the filling task is runing
+            # if not self._fill_task:
+            #     if await self._fill_cache_once():
+            #         self._fill_task = asyncio.ensure_future(self._fill_cache())
         # was in commit or waiting for one, notify it
         elif self._state in (ConsumerState.COMMIT, ConsumerState.JOIN):
-            self._commit_state = ConsumerState.IDLE
-            if self._state is ConsumerState.JOIN:
-                if self._commit:
-                    self._commit.set_result(None)
-                    self._commit = None
-            self._state = ConsumerState.COMMIT
+            await self._do_join()
+            # # self._commit_state = ConsumerState.IDLE
+            # self._commit_state = ConsumerState.PROCESS
+            # if self._state is ConsumerState.JOIN:
+            #     if self._commit:
+            #         self._commit.set_result(None)
+            #         self._commit = None
+            # self._state = ConsumerState.COMMIT
+            # # wait for commit to finish
+            # if not self._ready:
+            #     self._ready = asyncio.Future()
+            # try:
+            #     await asyncio.shield(self._ready)
+            # except asyncio.CancelledError:
+            #     print ('!!! cancelled during commit (pause')
+            #     raise
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def wait(self, aws=None, *, timeout=None, **kwargs):
@@ -196,15 +202,23 @@ class PartitionConsumer(PartitionArgument):
                 stream.pause()
                 await asyncio.Future()
         """
-        self.pause()
         if isinstance(aws, (int, float)) and timeout is None:
             timeout, aws = aws, None
-        if aws:
-            return await asyncio.wait(aws, timeout=timeout, **kwargs)
-        elif timeout is None:
-            await asyncio.Future()
-        elif timeout > 0:
-            await asyncio.sleep(timeout)
+        try:
+            if aws:
+                done, pending = await asyncio.wait(aws, timeout=timeout, **kwargs)
+            elif timeout is None:
+                return await asyncio.Future()
+            elif timeout > 0:
+                return await asyncio.sleep(timeout)
+            else:
+                return None
+        finally:
+            await self.pause()
+        update = list(filter(lambda task: task.done(), pending))
+        done.update(update)
+        pending.difference_update(update)
+        return done, pending
 
     async def getmany(self, *partitions, timeout_ms=0, max_records=None,
             max_records_per_partition=None):
@@ -222,7 +236,8 @@ class PartitionConsumer(PartitionArgument):
                         max_records_per_partition=max_records_per_partition)
             # update offsets
             for tp, rec in records.items():
-                self._app._offsets[tp] = rec[-1].offset + 1
+                self._app._commits[tp] = rec[0].offset
+                self._offsets[tp] = rec[-1].offset + 1
             return records
         finally:
             # refill the cache (this part is not asynchronous)
@@ -249,7 +264,8 @@ class PartitionConsumer(PartitionArgument):
                         *partitions)
             # update the offset
             tp = TopicPartition(msg.topic, msg.partition)
-            self._app._offsets[tp] = msg.offset + 1
+            self._app._commits[tp] = msg.offset
+            self._offsets[tp] = msg.offset + 1
             return msg
         finally:
             # refill the cache (this part is not asynchronous)
@@ -265,7 +281,7 @@ class PartitionConsumer(PartitionArgument):
         assert self._state is not ConsumerState.CLOSED
         # if we try to read more from a partition, commit all its messages
         for tp in partitions:
-            offset = self._app._offsets.get(tp)
+            offset = self._offsets.get(tp)
             if offset is not None:
                 self._app._commits[tp] = offset
         # if join required, join now
@@ -294,7 +310,7 @@ class PartitionConsumer(PartitionArgument):
                 await asyncio.wait((task, self._join),
                         return_when=asyncio.FIRST_COMPLETED)
             # cancelled, just cancel the task and raise
-            except:
+            except asyncio.CancelledError:
                 assert not task.done()
                 task.cancel()
                 raise
@@ -311,6 +327,7 @@ class PartitionConsumer(PartitionArgument):
                 # requesting for a join, do it before restarting the task
                 if self._state in (ConsumerState.JOIN, ConsumerState.COMMIT):
                     await self._do_join()
+                    assert self._state is ConsumerState.PROCESS
                     self._state = ConsumerState.READ
 
     async def _do_join(self):
@@ -328,9 +345,13 @@ class PartitionConsumer(PartitionArgument):
             # wait for commit to finish
             if not self._ready:
                 self._ready = asyncio.Future()
-            await asyncio.shield(self._ready)
+            try:
+                await asyncio.shield(self._ready)
+            except asyncio.CancelledError:
+                print ('!!! cancelled during commit')
+                raise
             # expected state after the commit
-            if self._state is ConsumerState.PROCESS:
+            if self._state in (ConsumerState.PROCESS, ConsumerState.READ):
                 break
             # a new commit has started already
             elif self._state in (ConsumerState.JOIN, ConsumerState.COMMIT):

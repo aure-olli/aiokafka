@@ -398,7 +398,6 @@ class GroupCoordinator(BaseCoordinator):
         member_metadata = {}
         all_subscribed_topics = set()
         for member_id, metadata_bytes in members:
-            print ('METADATA', self.consumer_protocol, self.consumer_protocol.METADATA)
             metadata = self.consumer_protocol.METADATA.decode(metadata_bytes)
             member_metadata[member_id] = metadata
             all_subscribed_topics.update(metadata.subscription)

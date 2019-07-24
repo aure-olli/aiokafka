@@ -240,6 +240,15 @@ class _AIOKafkaConsumer(AIOKafkaConsumer):
     def create_poll_waiter(self):
         return self._fetcher.create_poll_waiter()
 
+    def consumed_offsets(self):
+        subscription = self._subscription.subscription
+        if subscription is None:
+            return None
+        assignment = subscription.assignment
+        if assignment is None:
+            return None
+        return assignment.all_consumed_offsets()
+
 
 class Assignator:
 
@@ -258,7 +267,6 @@ class Assignator:
         return sorted(groups.values())
 
     def assign(self, cluster, member_metadata):
-        print ('assignator assign')
         groups = None
         for metadata in member_metadata.values():
             if groups is None:
@@ -303,7 +311,6 @@ class Assignator:
                 self.version, self.groups(topics))
 
     def on_assignment(self, assignment):
-        print ('assignator on_assignment', assignment)
         pass
 
 
@@ -355,6 +362,7 @@ class AIOKafkaApplication(object):
             send_backoff_ms=100,
             enable_idempotence=False,
             transactional_id=None,
+            transaction_timeout_ms=60000,
             request_timeout_ms=40 * 1000,
             retry_backoff_ms=100,
             auto_offset_reset='latest',
@@ -662,14 +670,12 @@ class AIOKafkaApplication(object):
         return PartitionableProducer(self, topics)
 
     async def commit(self):
-        print ('app commit')
         if not self.assigned: raise Exception('rebalancing')
         if not self._commit_task:
             self._commit_task = asyncio.ensure_future(self._do_commit())
         await asyncio.shield(self._commit_task)
 
     async def before_rebalance(self, revoked):
-        print ('app before_rebalance')
         self.assigned = False
         if self._auto_commit_task:
             self._auto_commit_task.cancel()
@@ -683,7 +689,9 @@ class AIOKafkaApplication(object):
         self._commits.clear()
 
     async def after_rebalance(self, assigned):
-        print ('app after_rebalance')
+        if self._closed: raise Exception('closed')
+        if self._txn_manager:
+            await self.begin_transaction()
         self.assigned = True
         self.ready = True
         if self._tasks:
@@ -698,12 +706,18 @@ class AIOKafkaApplication(object):
             if self._tasks:
                 await asyncio.gather(*(task.before_commit()
                         for task in self._tasks))
-            if self._group_id and self._commits:
+            # even offsets of unread partitions should be committed
+            # to avoid using `auto_offset_reset` after a reassignment
+            commits = self._group_id and self.consumer.consumed_offsets()
+            if commits:
+                commits.update(self._commits)
+            if commits:
+            # if self._group_id and self._commits:
                 if self._txn_manager:
                     await self.send_offsets_to_transaction(
-                            self._commits, self._group_id)
+                           commits, self._group_id)
                 else:
-                    await self.consumer.commit(self._commits)
+                    await self.consumer.commit(commits)
             await self.flush()
             if self._txn_manager:
                 await self.commit_transaction()
@@ -773,7 +787,7 @@ class AIOKafkaApplication(object):
                 highwater <= position
 
     async def start(self):
-        print ('app start')
+        print ('start')
         """Connect to Kafka cluster and check server version"""
         log.debug("Starting the Kafka producer")  # trace
         await self.client.bootstrap()
@@ -1015,6 +1029,7 @@ class AIOKafkaApplication(object):
                 "You need to configure transaction_id to use transactions")
 
     async def begin_transaction(self):
+        print ('begin_transaction')
         self._ensure_transactional()
         log.debug(
             "Beginning a new transaction for id %s",
@@ -1026,6 +1041,7 @@ class AIOKafkaApplication(object):
         self._txn_manager.begin_transaction()
 
     async def commit_transaction(self):
+        print ('commit_transaction')
         self._ensure_transactional()
         log.debug(
             "Committing transaction for id %s",
@@ -1051,6 +1067,9 @@ class AIOKafkaApplication(object):
         return TransactionContext(self)
 
     async def send_offsets_to_transaction(self, offsets, group_id):
+        print ('send_offsets_to_transaction',
+                [(tp.topic, tp.partition, offset)
+                for tp, offset in offsets.items()])
         self._ensure_transactional()
 
         if not self._txn_manager.is_in_transaction():
