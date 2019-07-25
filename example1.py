@@ -10,7 +10,8 @@ from aiokafka.application import AIOKafkaApplication
 from aiokafka.application.tasks import AbstractTask, get_parition
 from aiokafka.structs import TopicPartition
 
-consumer = AIOKafkaConsumer('test', loop=loop, isolation_level='read_committed')
+consumer = AIOKafkaConsumer('test0', loop=loop,
+		auto_offset_reset='earliest', isolation_level='read_committed')
 loop.run_until_complete(consumer.start())
 # time.sleep(random.uniform(5, 15))
 
@@ -25,10 +26,11 @@ while True:
 	print ('run for', duration)
 	local_loop = asyncio.new_event_loop()
 	app = AIOKafkaApplication(loop=local_loop,
-			auto_offset_reset='latest', group_id='test',
+			auto_offset_reset='earliest', group_id='test',
 			max_partition_fetch_bytes=20000,
 			isolation_level='read_committed',
 			transactional_id='test-'+''.join(random.choices(string.ascii_lowercase, k=8)), enable_idempotence=True)
+			# transactional_id='test', enable_idempotence=True)
 
 	async def merge(partition, input, output, keyvalue, latency=5000):
 		print ('merge', partition)
@@ -47,18 +49,18 @@ while True:
 					tp = TopicPartition(message.topic, message.partition)
 					pending.remove(tp)
 					messages[tp] = (*keyvalue(message), message)
-					# print (partition, 'message', keyvalue(message))
+					print (partition, 'message', keyvalue(message))
 					if oldest is None or message.timestamp < oldest.timestamp:
 						oldest = message
 					# no pending partition, send the oldest message
 				if not pending:
-					# print (partition, 'not pending')
+					print (partition, 'not pending')
 					minkey = min(k for k, _, _ in messages.values())
 					for tp, v in [(tp, v) for tp, (k, v, _) in messages.items()
 							if k <= minkey]:
 						del messages[tp]
 						pending.add(tp)
-						# print (partition, 'value', v)
+						print (partition, 'value', v)
 						allvalues[tp.partition].append(v)
 						await output.send(value=v)
 						# time.sleep(0.005)
@@ -68,7 +70,10 @@ while True:
 								key=lambda m: m.timestamp)
 					else: oldest = None
 			# finished waiting before a new message, cancel the fetch
-			else: task.cancel()
+			else:
+				task.cancel()
+				# try: await task
+				# except asyncio.CancelledError: pass
 
 			wait = None
 			while wait is None:
@@ -76,29 +81,29 @@ while True:
 				if not oldest or not all(await asyncio.gather(
 						*(app.consumed(tp) for tp in pending))):
 					wait = asyncio.Future()
-					# print (partition, 'Future')
+					print (partition, 'Future')
 					break
 				diff = (oldest.timestamp + latency) / 1000 - time.time()
 				# the oldest message is not that old yet, wait for it to be older
 				if diff and diff > 0:
 					wait = asyncio.sleep(diff)
-					# print (partition, 'sleep', diff)
+					print (partition, 'sleep', diff)
 					break
 				# the last metadata are too old, wait for fresher metadata
 				last_poll = min(app.last_poll_timestamp(tp) for tp in pending)
 				if oldest.timestamp + latency > last_poll:
 					wait = app.consumer.create_poll_waiter()
-					# print (partition, 'create_poll_waiter')
+					print (partition, 'create_poll_waiter')
 					break
 				# Send all the messages which are too old,
 				# and the messages that should appear before them
-				# print (partition, 'all consumed')
+				print (partition, 'all consumed')
 				minkey = min(k for k, _, _ in messages.values())
 				for tp, v in [(tp, v) for tp, (k, v, _) in messages.items()
 						if k <= minkey]:
 					del messages[tp]
 					pending.add(tp)
-					# print (partition, 'value', v)
+					print (partition, 'value', v)
 					allvalues[tp.partition].append(v)
 					await output.send(value=v)
 					# time.sleep(0.005)
@@ -115,7 +120,7 @@ while True:
 
 	task = app.partition_task(merge, get_parition,
 		app.partitionable_consumer('test1', 'test2', 'test3', 'test4', 'test5', cache=1),
-		app.partitionable_producer('test'),
+		app.partitionable_producer('test0'),
 		keyvalue=keyvalue)
 
 	import asyncio
@@ -159,7 +164,7 @@ while True:
 	if length == sum(len(r) for r in allvalues.values()):
 		break
 
-unseen = set(range(500))
+unseen = set(range(50000))
 async def check():
 	allvalues.clear()
 	async for msg in consumer:
@@ -168,7 +173,7 @@ async def check():
 		allvalues[msg.partition].append(value)
 		# if sum(len(r) for r in allvalues.values()) == 5000: break
 
-loop.run_until_complete(asyncio.wait([check()], timeout=10))
+loop.run_until_complete(asyncio.wait([check()], timeout=2))
 loop.run_until_complete(consumer.stop())
 
 # import asyncio

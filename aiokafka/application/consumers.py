@@ -68,9 +68,8 @@ class PartitionConsumer(PartitionArgument):
         self._cache = cache
         # all the dequeues of each each partition
         self._state = ConsumerState.INIT
-        self._queues = (collections.defaultdict(collections.deque)
-                if cache else None)
-        self._offsets = {} # the offset after the last fetched message
+        self._queues = collections.defaultdict(collections.deque)
+        self._get_task = None
         self._fill_task = None # the task to fill the cache when not reading
         self._join = None # notify it to interrupt read and start to join
         self._commit = None # notify it when ready to commit
@@ -231,13 +230,14 @@ class PartitionConsumer(PartitionArgument):
             # else request data
             if records is None or not records and timeout_ms > 0:
                 records = await self._read_or_fail(
-                        self._app.consumer.getmany, *partitions,
+                        self._app.consumer.getmany, self._cachemany,
+                        *partitions,
                         timeout_ms=timeout_ms, max_records=max_records,
                         max_records_per_partition=max_records_per_partition)
             # update offsets
             for tp, rec in records.items():
                 self._app._commits[tp] = rec[0].offset
-                self._offsets[tp] = rec[-1].offset + 1
+                self._app._offsets[tp] = rec[-1].offset + 1
             return records
         finally:
             # refill the cache (this part is not asynchronous)
@@ -245,6 +245,11 @@ class PartitionConsumer(PartitionArgument):
                 self._state = ConsumerState.PROCESS
                 if await self._fill_cache_once():
                     self._fill_task = asyncio.ensure_future(self._fill_cache())
+
+    def _cachemany(self, results):
+        print ('!!!!!', 'cachemany', results)
+        for tp, messages in results.items():
+            self._queues[tp].extend(messages)
 
     async def getone(self, *partitions):
         if not partitions: partitions = self._assignment
@@ -260,12 +265,13 @@ class PartitionConsumer(PartitionArgument):
                         break
             # else request data
             if not msg:
-                msg = await self._read_or_fail(self._app.consumer.getone,
+                await self._read_or_fail(
+                        self._app.consumer.getone, self._cacheone,
                         *partitions)
             # update the offset
             tp = TopicPartition(msg.topic, msg.partition)
             self._app._commits[tp] = msg.offset
-            self._offsets[tp] = msg.offset + 1
+            self._app._offsets[tp] = msg.offset + 1
             return msg
         finally:
             # refill the cache (this part is not asynchronous)
@@ -274,6 +280,10 @@ class PartitionConsumer(PartitionArgument):
                 if await self._fill_cache_once():
                     self._fill_task = asyncio.ensure_future(self._fill_cache())
 
+    def _cacheone(self, msg):
+        tp = TopicPartition(msg.topic, msg.partition)
+        self._queues[tp].append(msg)
+
     async def _get_read(self, partitions):
         """
         Deal with commits and wait for the stream to be ready to read
@@ -281,7 +291,7 @@ class PartitionConsumer(PartitionArgument):
         assert self._state is not ConsumerState.CLOSED
         # if we try to read more from a partition, commit all its messages
         for tp in partitions:
-            offset = self._offsets.get(tp)
+            offset = self._app._offsets.get(tp)
             if offset is not None:
                 self._app._commits[tp] = offset
         # if join required, join now
@@ -297,13 +307,15 @@ class PartitionConsumer(PartitionArgument):
         # finally ready to read
         self._state = ConsumerState.READ
 
-    async def _read_or_fail(self, fun, *kargs, **kwargs):
+    async def _read_or_fail(self, fun, cache, *kargs, **kwargs):
         """
         Calls the fetching function while looking for commits and close
         """
         while True:
             # maybe a CLOSED state
-            assert self._state is ConsumerState.READ
+            if self._state is not ConsumerState.READ:
+                raise RuntimeError('state ??? ' + self._state.name)
+            # assert self._state is ConsumerState.READ
             # wait for the fecth task, but also for commit and close
             task = asyncio.ensure_future(fun(*kargs, **kwargs))
             try:
@@ -311,7 +323,6 @@ class PartitionConsumer(PartitionArgument):
                         return_when=asyncio.FIRST_COMPLETED)
             # cancelled, just cancel the task and raise
             except asyncio.CancelledError:
-                assert not task.done()
                 task.cancel()
                 raise
             # the task is done, return its result or its exception
@@ -345,11 +356,7 @@ class PartitionConsumer(PartitionArgument):
             # wait for commit to finish
             if not self._ready:
                 self._ready = asyncio.Future()
-            try:
-                await asyncio.shield(self._ready)
-            except asyncio.CancelledError:
-                print ('!!! cancelled during commit')
-                raise
+            await asyncio.shield(self._ready)
             # expected state after the commit
             if self._state in (ConsumerState.PROCESS, ConsumerState.READ):
                 break
@@ -440,3 +447,13 @@ class PartitionConsumer(PartitionArgument):
         A task to fill the cache
         """
         while await self._fill_cache_once(timeout_ms): pass
+
+class GetTask(asyncio.Task):
+
+    def __init__(self, coro, parent):
+        self._parent = parent
+        super().__init__(coro)
+
+    def cancel(self):
+        self._parent._get_task = None
+        super().cancel()

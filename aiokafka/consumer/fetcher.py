@@ -549,16 +549,16 @@ class Fetcher:
                 done_pending = self._pending_tasks.intersection(done_set)
                 if done_pending:
                     has_new_data = any(fut.result() for fut in done_pending)
-                    if has_new_data:
-                        for waiter in self._fetch_waiters:
-                            # we added some messages to self._records,
-                            # wake up waiters
-                            self._notify(waiter)
                     for waiter in self._poll_waiters:
                         # we added some messages to self._records,
                         # wake up waiters
                         self._notify(waiter)
                     self._pending_tasks -= done_pending
+                    if has_new_data:
+                        for waiter in self._fetch_waiters:
+                            # we added some messages to self._records,
+                            # wake up waiters
+                            self._notify(waiter)
         except asyncio.CancelledError:
             pass
         except Exception:  # pragma: no cover
