@@ -340,7 +340,7 @@ class PartitionConsumer(PartitionArgument):
             finally:
                 join.remove_done_callback(cb)
             # the task is done, return its result or its exception
-            if not task.cancelled():
+            if task.done() and not task.cancelled():
                 # check that the state is still compatible with a read
                 # if in join state, still return the data to avoid losing it
                 # the only other expected state is CLOSED
@@ -348,6 +348,7 @@ class PartitionConsumer(PartitionArgument):
                 return task.result()
             # something else happened, cancel the task and check
             else:
+                task.cancel()
                 # requesting for a join, do it before restarting the task
                 if self._state in (ConsumerState.JOIN, ConsumerState.COMMIT):
                     await self._do_join()
