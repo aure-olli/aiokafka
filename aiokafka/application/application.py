@@ -323,12 +323,14 @@ class RebalanceListener(ConsumerRebalanceListener):
         self._app = app
 
     async def on_partitions_revoked(self, revoked):
-        print ('on_partitions_revoked')
+        print ('on_partitions_revoked begin')
         await self._app.before_rebalance(revoked)
+        print ('on_partitions_revoked')
 
     async def on_partitions_assigned(self, assigned):
         print ('on_partitions_assigned')
         await self._app.after_rebalance(assigned)
+        print ('on_partitions_assigned end')
 
 
 class AIOKafkaApplication(object):
@@ -787,7 +789,7 @@ class AIOKafkaApplication(object):
                 highwater <= position
 
     async def start(self):
-        print ('start')
+        print ('start begin')
         """Connect to Kafka cluster and check server version"""
         log.debug("Starting the Kafka producer")  # trace
         await self.client.bootstrap()
@@ -819,6 +821,7 @@ class AIOKafkaApplication(object):
         if not self._auto_commit_task:
             self._auto_commit_task = asyncio.ensure_future(
                     self._do_auto_commit())
+        print ('start end')
 
     async def flush(self):
         """Wait untill all batches are Delivered and futures resolved"""
@@ -1029,7 +1032,7 @@ class AIOKafkaApplication(object):
                 "You need to configure transaction_id to use transactions")
 
     async def begin_transaction(self):
-        print ('begin_transaction')
+        print ('begin_transaction begin')
         self._ensure_transactional()
         log.debug(
             "Beginning a new transaction for id %s",
@@ -1039,9 +1042,10 @@ class AIOKafkaApplication(object):
             loop=self._loop
         )
         self._txn_manager.begin_transaction()
+        print ('begin_transaction end')
 
     async def commit_transaction(self):
-        print ('commit_transaction')
+        print ('commit_transaction begin')
         self._ensure_transactional()
         log.debug(
             "Committing transaction for id %s",
@@ -1051,6 +1055,7 @@ class AIOKafkaApplication(object):
             self._txn_manager.wait_for_transaction_end(),
             loop=self._loop
         )
+        print ('commit_transaction end')
 
     async def abort_transaction(self):
         self._ensure_transactional()
@@ -1086,3 +1091,4 @@ class AIOKafkaApplication(object):
             formatted_offsets, group_id)
         fut = self._txn_manager.add_offsets_to_txn(formatted_offsets, group_id)
         await asyncio.shield(fut, loop=self._loop)
+        print ('send_offsets_to_transaction end')

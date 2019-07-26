@@ -246,7 +246,6 @@ class PartitionConsumer(PartitionArgument):
                     self._fill_task = asyncio.ensure_future(self._fill_cache())
 
     def _cachemany(self, results):
-        print ('!!!!!', 'cachemany', results)
         for tp, messages in results.items():
             self._queues[tp].extend(messages)
 
@@ -334,14 +333,14 @@ class PartitionConsumer(PartitionArgument):
                 if not joining:
                     if not task.done():
                         task.cancel()
-                    elif not task.cancel():
+                    elif not task.cancelled() and not task.exception():
                         print ('!!!!!', '_read_or_fail task.done()', task)
                         cache(task.result())
                     raise
             finally:
                 join.remove_done_callback(cb)
             # the task is done, return its result or its exception
-            if task.done() and not task.cancel():
+            if not task.cancelled():
                 # check that the state is still compatible with a read
                 # if in join state, still return the data to avoid losing it
                 # the only other expected state is CLOSED
@@ -349,7 +348,6 @@ class PartitionConsumer(PartitionArgument):
                 return task.result()
             # something else happened, cancel the task and check
             else:
-                task.cancel()
                 # requesting for a join, do it before restarting the task
                 if self._state in (ConsumerState.JOIN, ConsumerState.COMMIT):
                     await self._do_join()

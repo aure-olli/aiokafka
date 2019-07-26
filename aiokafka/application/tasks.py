@@ -140,7 +140,6 @@ class PartitionTask(AbstractTask):
             app.group(*group)
 
     async def before_rebalance(self, revoked):
-        print ('task before_rebalance')
         # commit if not already done
         await self.before_commit()
         # already rebalancing
@@ -157,7 +156,6 @@ class PartitionTask(AbstractTask):
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def after_rebalance(self, assigned):
-        print ('task after_rebalance')
         # not started yet, don't start anything
         if self._state is TaskState.INIT:
             return
@@ -168,7 +166,6 @@ class PartitionTask(AbstractTask):
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def before_commit(self):
-        print ('task before_commit')
         # already committing, nothing to do
         if self._state in (TaskState.COMMIT, TaskState.REBALANCE):
             return
@@ -201,7 +198,7 @@ class PartitionTask(AbstractTask):
                     self._commit = None
                 # joining went wrong, stop everything
                 # and tag waiting to restart
-                except:
+                except Exception as e:
                     self._commit = None
                     self._state = TaskState.WAIT
                     if self._task and not self._task.done():
@@ -221,7 +218,6 @@ class PartitionTask(AbstractTask):
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def after_commit(self):
-        print ('task after_commit')
         # not started yet, don't start anything
         if self._state is TaskState.INIT:
             return
@@ -237,7 +233,6 @@ class PartitionTask(AbstractTask):
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def start(self):
-        print ('task start')
         self._app.register_task(self)
         # ready to start
         if self._state is TaskState.INIT:
@@ -314,7 +309,7 @@ class PartitionTask(AbstractTask):
         # cancel everything and close the partition arguments
         except asyncio.CancelledError:
             raise
-        except:
+        except Exception as e:
             log.error('Exception while running the tasks', exc_info=True)
             raise
         finally:

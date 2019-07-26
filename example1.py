@@ -3,6 +3,7 @@ import asyncio
 import collections
 import random
 import string
+import traceback
 loop = asyncio.get_event_loop()
 
 from aiokafka.consumer import AIOKafkaConsumer
@@ -33,28 +34,72 @@ while True:
 			# transactional_id='test', enable_idempotence=True)
 
 	async def merge(partition, input, output, keyvalue, latency=5000):
-		print ('merge', partition)
-		messages = {}
-		pending = set(input.assignment)
-		oldest = None
-		wait = asyncio.Future()
-		while True:
-			# fetch data of pending partitions
-			task = asyncio.ensure_future(input.getmany(*pending,
-					max_records_per_partition=1, timeout_ms=None))
-			await input.wait((task, wait), return_when=asyncio.FIRST_COMPLETED)
-			# a new message arrived
-			if task.done():
-				for message in (msg for l in task.result().values() for msg in l):
-					tp = TopicPartition(message.topic, message.partition)
-					pending.remove(tp)
-					messages[tp] = (*keyvalue(message), message)
-					print (partition, 'message', keyvalue(message))
-					if oldest is None or message.timestamp < oldest.timestamp:
-						oldest = message
-					# no pending partition, send the oldest message
-				if not pending:
-					print (partition, 'not pending')
+		try:
+			print ('merge', partition)
+			messages = {}
+			pending = set(input.assignment)
+			oldest = None
+			wait = asyncio.Future()
+			while True:
+				# fetch data of pending partitions
+				task = asyncio.ensure_future(input.getmany(*pending,
+						max_records_per_partition=1, timeout_ms=None))
+				await input.wait((task, wait), return_when=asyncio.FIRST_COMPLETED)
+				# a new message arrived
+				if task.done():
+					for message in (msg for l in task.result().values() for msg in l):
+						tp = TopicPartition(message.topic, message.partition)
+						pending.remove(tp)
+						messages[tp] = (*keyvalue(message), message)
+						print (partition, 'message', keyvalue(message))
+						if oldest is None or message.timestamp < oldest.timestamp:
+							oldest = message
+						# no pending partition, send the oldest message
+					if not pending:
+						print (partition, 'not pending')
+						minkey = min(k for k, _, _ in messages.values())
+						for tp, v in [(tp, v) for tp, (k, v, _) in messages.items()
+								if k <= minkey]:
+							del messages[tp]
+							pending.add(tp)
+							print (partition, 'value', v)
+							allvalues[tp.partition].append(v)
+							await output.send(value=v)
+							# time.sleep(0.005)
+						# get the new oldest
+						if messages:
+							oldest = min((m for _, _, m in messages.values()),
+									key=lambda m: m.timestamp)
+						else: oldest = None
+				# finished waiting before a new message, cancel the fetch
+				else:
+					task.cancel()
+					# try: await task
+					# except asyncio.CancelledError: pass
+
+				wait = None
+				while wait is None:
+					# partitions are not consumed, so wait forever
+					if not oldest or not all(await asyncio.gather(
+							*(app.consumed(tp) for tp in pending))):
+						wait = asyncio.Future()
+						print (partition, 'Future')
+						break
+					diff = (oldest.timestamp + latency) / 1000 - time.time()
+					# the oldest message is not that old yet, wait for it to be older
+					if diff and diff > 0:
+						wait = asyncio.sleep(diff)
+						print (partition, 'sleep', diff)
+						break
+					# the last metadata are too old, wait for fresher metadata
+					last_poll = min(app.last_poll_timestamp(tp) for tp in pending)
+					if oldest.timestamp + latency > last_poll:
+						wait = app.consumer.create_poll_waiter()
+						print (partition, 'create_poll_waiter')
+						break
+					# Send all the messages which are too old,
+					# and the messages that should appear before them
+					print (partition, 'all consumed')
 					minkey = min(k for k, _, _ in messages.values())
 					for tp, v in [(tp, v) for tp, (k, v, _) in messages.items()
 							if k <= minkey]:
@@ -69,50 +114,10 @@ while True:
 						oldest = min((m for _, _, m in messages.values()),
 								key=lambda m: m.timestamp)
 					else: oldest = None
-			# finished waiting before a new message, cancel the fetch
-			else:
-				task.cancel()
-				# try: await task
-				# except asyncio.CancelledError: pass
-
-			wait = None
-			while wait is None:
-				# partitions are not consumed, so wait forever
-				if not oldest or not all(await asyncio.gather(
-						*(app.consumed(tp) for tp in pending))):
-					wait = asyncio.Future()
-					print (partition, 'Future')
-					break
-				diff = (oldest.timestamp + latency) / 1000 - time.time()
-				# the oldest message is not that old yet, wait for it to be older
-				if diff and diff > 0:
-					wait = asyncio.sleep(diff)
-					print (partition, 'sleep', diff)
-					break
-				# the last metadata are too old, wait for fresher metadata
-				last_poll = min(app.last_poll_timestamp(tp) for tp in pending)
-				if oldest.timestamp + latency > last_poll:
-					wait = app.consumer.create_poll_waiter()
-					print (partition, 'create_poll_waiter')
-					break
-				# Send all the messages which are too old,
-				# and the messages that should appear before them
-				print (partition, 'all consumed')
-				minkey = min(k for k, _, _ in messages.values())
-				for tp, v in [(tp, v) for tp, (k, v, _) in messages.items()
-						if k <= minkey]:
-					del messages[tp]
-					pending.add(tp)
-					print (partition, 'value', v)
-					allvalues[tp.partition].append(v)
-					await output.send(value=v)
-					# time.sleep(0.005)
-				# get the new oldest
-				if messages:
-					oldest = min((m for _, _, m in messages.values()),
-							key=lambda m: m.timestamp)
-				else: oldest = None
-				# we don't know what to wait for next
+					# we don't know what to wait for next
+		except Exception as e:
+			print (partition, '!!! merge except', traceback.format_exc())
+			raise
 
 	def keyvalue(message):
 		value = message.value.decode('ascii').split('-')[:2]
@@ -161,6 +166,7 @@ while True:
 
 	local_loop.run_until_complete(run())
 	local_loop.close()
+	print ('=== closed ===')
 	if length == sum(len(r) for r in allvalues.values()):
 		break
 

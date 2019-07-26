@@ -678,7 +678,7 @@ class SendProduceReqHandler(BaseHandler):
     def create_request(self):
         topics = collections.defaultdict(list)
         for tp, batch in self._batches.items():
-            print ('produce', PATTERN.findall(batch.get_data_buffer()))
+            # print ('produce', PATTERN.findall(batch.get_data_buffer()))
             topics[tp.topic].append(
                 (tp.partition, batch.get_data_buffer())
             )
