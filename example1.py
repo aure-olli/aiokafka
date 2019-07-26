@@ -169,7 +169,7 @@ async def check():
 	allvalues.clear()
 	async for msg in consumer:
 		value = tuple(msg.value.decode('ascii').split('-'))
-		unseen.remove(int(value[1]))
+		unseen.discard(int(value[1]))
 		allvalues[msg.partition].append(value)
 		# if sum(len(r) for r in allvalues.values()) == 5000: break
 

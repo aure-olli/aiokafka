@@ -69,7 +69,6 @@ class PartitionConsumer(PartitionArgument):
         # all the dequeues of each each partition
         self._state = ConsumerState.INIT
         self._queues = collections.defaultdict(collections.deque)
-        self._get_task = None
         self._fill_task = None # the task to fill the cache when not reading
         self._join = None # notify it to interrupt read and start to join
         self._commit = None # notify it when ready to commit
@@ -318,15 +317,31 @@ class PartitionConsumer(PartitionArgument):
             # assert self._state is ConsumerState.READ
             # wait for the fecth task, but also for commit and close
             task = asyncio.ensure_future(fun(*kargs, **kwargs))
+            joining = False
+            def cb(_):
+                nonlocal joining
+                if not task.done():
+                    task.cancel()
+                    joining = True
+            join = self._join
+            join.add_done_callback(cb)
             try:
-                await asyncio.wait((task, self._join),
-                        return_when=asyncio.FIRST_COMPLETED)
+                await task
+                # await asyncio.wait((task, self._join),
+                #         return_when=asyncio.FIRST_COMPLETED)
             # cancelled, just cancel the task and raise
             except asyncio.CancelledError:
-                task.cancel()
-                raise
+                if not joining:
+                    if not task.done():
+                        task.cancel()
+                    elif not task.cancel():
+                        print ('!!!!!', '_read_or_fail task.done()', task)
+                        cache(task.result())
+                    raise
+            finally:
+                join.remove_done_callback(cb)
             # the task is done, return its result or its exception
-            if task.done():
+            if task.done() and not task.cancel():
                 # check that the state is still compatible with a read
                 # if in join state, still return the data to avoid losing it
                 # the only other expected state is CLOSED
@@ -447,13 +462,3 @@ class PartitionConsumer(PartitionArgument):
         A task to fill the cache
         """
         while await self._fill_cache_once(timeout_ms): pass
-
-class GetTask(asyncio.Task):
-
-    def __init__(self, coro, parent):
-        self._parent = parent
-        super().__init__(coro)
-
-    def cancel(self):
-        self._parent._get_task = None
-        super().cancel()
