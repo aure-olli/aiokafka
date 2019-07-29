@@ -47,6 +47,7 @@ class SyncTask(tasks.Task, SyncFuture):
         coro = self._coro
         self._fut_waiter = None
 
+        print ('self.__class__._current_tasks[self._loop] = self', self)
         self.__class__._current_tasks[self._loop] = self
         # Call either coro.throw(exc) or coro.send(None).
         try:
@@ -120,7 +121,9 @@ class SyncTask(tasks.Task, SyncFuture):
                         'Task got bad yield: {!r}'.format(result)))
         finally:
             ### fix KeyError with SyncFuture ###
-            self.__class__._current_tasks.pop(self._loop, None)
+            print ('self.__class__._current_tasks.pop(self._loop)', self)
+            self.__class__._current_tasks.pop(self._loop)
+            # self.__class__._current_tasks.pop(self._loop, None)
             self = None  # Needed to break cycles when an exception occurs.
 
 tasks.Task._step = SyncTask._step

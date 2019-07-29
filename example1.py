@@ -51,18 +51,18 @@ while True:
 						tp = TopicPartition(message.topic, message.partition)
 						pending.remove(tp)
 						messages[tp] = (*keyvalue(message), message)
-						print (partition, 'message', keyvalue(message))
+						# print (partition, 'message', keyvalue(message))
 						if oldest is None or message.timestamp < oldest.timestamp:
 							oldest = message
 						# no pending partition, send the oldest message
 					if not pending:
-						print (partition, 'not pending')
+						# print (partition, 'not pending')
 						minkey = min(k for k, _, _ in messages.values())
 						for tp, v in [(tp, v) for tp, (k, v, _) in messages.items()
 								if k <= minkey]:
 							del messages[tp]
 							pending.add(tp)
-							print (partition, 'value', v)
+							# print (partition, 'value', v)
 							allvalues[tp.partition].append(v)
 							await output.send(value=v)
 							# time.sleep(0.005)
@@ -83,29 +83,29 @@ while True:
 					if not oldest or not all(await asyncio.gather(
 							*(app.consumed(tp) for tp in pending))):
 						wait = asyncio.Future()
-						print (partition, 'Future')
+						# print (partition, 'Future')
 						break
 					diff = (oldest.timestamp + latency) / 1000 - time.time()
 					# the oldest message is not that old yet, wait for it to be older
 					if diff and diff > 0:
 						wait = asyncio.sleep(diff)
-						print (partition, 'sleep', diff)
+						# print (partition, 'sleep', diff)
 						break
 					# the last metadata are too old, wait for fresher metadata
 					last_poll = min(app.last_poll_timestamp(tp) for tp in pending)
 					if oldest.timestamp + latency > last_poll:
 						wait = app.consumer.create_poll_waiter()
-						print (partition, 'create_poll_waiter')
+						# print (partition, 'create_poll_waiter')
 						break
 					# Send all the messages which are too old,
 					# and the messages that should appear before them
-					print (partition, 'all consumed')
+					# print (partition, 'all consumed')
 					minkey = min(k for k, _, _ in messages.values())
 					for tp, v in [(tp, v) for tp, (k, v, _) in messages.items()
 							if k <= minkey]:
 						del messages[tp]
 						pending.add(tp)
-						print (partition, 'value', v)
+						# print (partition, 'value', v)
 						allvalues[tp.partition].append(v)
 						await output.send(value=v)
 						# time.sleep(0.005)

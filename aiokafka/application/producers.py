@@ -84,7 +84,6 @@ class PartitionProducer(PartitionArgument):
 
     async def send(self, topic=None, value=None, key=None, partition=None,
             timestamp_ms=None, headers=None):
-        # print ('send', value)
         topic, partition = await self._get_send(topic, partition)
         try:
             future = asyncio.Future()

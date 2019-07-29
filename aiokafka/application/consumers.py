@@ -74,6 +74,7 @@ class PartitionConsumer(PartitionArgument):
         self._commit = None # notify it when ready to commit
         self._commit_state = None # the state after the commit is finished
         self._ready = None # notify it when ready to read
+        self._cache_fun = None
 
     async def start(self):
         assert self._state is ConsumerState.INIT

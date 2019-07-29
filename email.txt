@@ -94,7 +94,7 @@ With that librairy, the previous functions are possible and intuitive
 
 No need to use `syncio` anywhere else in the code, which makes it totally transparent for the end user.
 
-This "library" can be found here: https://github.com/aure-olli/aiokafka/blob/streaming/syncio.py
+This "library" can be found here: https://github.com/aure-olli/aiokafka/blob/cd766dc6b5d36048fdbb04784f18a83e34094755/syncio.py
 It implements `SyncFuture`, `SyncTask`, `ensure_sync_future`, `sync_wait`, `sync_wait_for`, `sync_gather` and `sync_shield`.  It requires to use cpython 3.6, and to disable C `_syncio`. On my machine:
 
     sudo mv /usr/lib/python3.6/lib-dynload/_asyncio.cpython-36m-x86_64-linux-gnu.so /usr/lib/python3.6/lib-dynload/_asyncio.cpython-36m-x86_64-linux-gnu.so.old

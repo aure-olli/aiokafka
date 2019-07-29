@@ -1146,7 +1146,6 @@ class GroupCoordinator(BaseCoordinator):
                     log.debug("No committed offset for partition %s", tp)
                 else:
                     offsets[tp] = OffsetAndMetadata(offset, metadata)
-        print ('_do_fetch_commit_offsets', offsets)
         return offsets
 
 
