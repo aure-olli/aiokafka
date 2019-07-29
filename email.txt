@@ -1,8 +1,8 @@
 asyncio futures and tasks with synchronous callbacks
 
-in asyncio, when a task awaits for another task (or future), it can be cancelled right after the awaited task finished. Thus, if the awaited task was consuming data, the data will be lost.
+In asyncio, when a task awaits for another task (or future), it can be cancelled right after the awaited task finished. Thus, if the awaited task has consumed data, the data is lost.
 
-For instance, with the following code
+For instance, with the following code:
 
     import asyncio
 
@@ -24,7 +24,7 @@ For instance, with the following code
         task = asyncio.ensure_future(consume_data())
         return await task
 
-If I perform those exact steps
+If I perform those exact steps:
 
     async def test():
         task = asyncio.ensure_future(wrapped_consumer())
@@ -39,14 +39,15 @@ If I perform those exact steps
     loop = asyncio.get_event_loop()
     loop.run_until_complete(test())
 
-Then I can see that the task has been cancelled despite the data being consumed
+Then I can see that the task has been cancelled despite the data being consumed. Since the result of `wrapped_consumer` cannot be retrieved, the data is forever lost.
 
     task <Task cancelled coro=<wrapped_consumer() done, defined at <ipython-input-1-de4ad193b1d0>:17>>
     available_data []
 
-This side effect does not happen when awaiting a coroutine, but coroutine are not as flexible as tasks. It happens when awaiting a `Future`, a `Task`, or any function like `asyncio.wait`, `asyncio.wait_for` or `asyncio.gather`. There is then no way to do anything equivalent to:
+This side effect does not happen when awaiting a coroutine, but coroutine are not as flexible as tasks. It happens when awaiting a `Future`, a `Task`, or any function like `asyncio.wait`, `asyncio.wait_for` or `asyncio.gather` () which all inherit from or use `Future`). There is then no way to do anything equivalent to:
 
-    async def wrapped_consumer():
+    stop_future = asyncio.Future()
+    async def wrapped_consumer2():
         task = asyncio.ensure_future(consume_data())
         try:
             await asyncio.wait([task, stop_future])
@@ -64,19 +65,22 @@ https://github.com/python/cpython/blob/3.6/Lib/asyncio/futures.py#L202
         for callback in callbacks:
             self._loop.call_soon(callback, self)
 
-I propose to create synchronous versions of those, or `synchronous` parameter, that turns callback of `Future` synchronous. I've experimented a simple librairy `syncio` with python 3.6 to do this (it is harder with later versions due to the massive use of private methods).
+I propose to create synchronous versions of those, or `synchronous_callback` parameter, that turns callback of `Future` synchronous. I've experimented a simple librairy `syncio` with cpython 3.6 to do this (it is harder to patch later versions due to the massive use of private methods).
 Basically, needs to:
-- replace the `Future._schedule_callbacks` method by a synchronous version
-- fix `Task._step` to not fail when cleaning `_current_tasks` (https://github.com/python/cpython/blob/3.6/Lib/asyncio/tasks.py#L245)
-- rewrite all the functions to use synchronous futures instead of normal ones
+1) replace the `Future._schedule_callbacks` method by a synchronous version
+2) fix `Task._step` to not fail when cleaning `_current_tasks` (https://github.com/python/cpython/blob/3.6/Lib/asyncio/tasks.py#L245)
+3) rewrite all the functions to use synchronous futures instead of normal ones
 
 With that librairy, the previous functions are possible and intuitive
 
+    import syncio
+    
     async def wrapped_consumer():
         task = syncio.ensure_sync_future(consume_data())
         return await task
 
-    async def wrapped_consumer():
+    stop_future = asyncio.Future()
+    async def wrapped_consumer2():
         task = syncio.ensure_sync_future(consume_data())
         try:
             await syncio.sync_wait([task, stop_future])
@@ -88,4 +92,14 @@ With that librairy, the previous functions are possible and intuitive
         else:
             raise RuntimeError('stopped')
 
-No need to use `syncio` anywhere else in the code
+No need to use `syncio` anywhere else in the code, which makes it totally transparent for the end user.
+
+This "library" can be found here: https://github.com/aure-olli/aiokafka/blob/streaming/syncio.py
+It implements `SyncFuture`, `SyncTask`, `ensure_sync_future`, `sync_wait`, `sync_wait_for`, `sync_gather` and `sync_shield`.  It requires to use cpython 3.6, and to disable C `_syncio`. On my machine:
+
+    sudo mv /usr/lib/python3.6/lib-dynload/_asyncio.cpython-36m-x86_64-linux-gnu.so /usr/lib/python3.6/lib-dynload/_asyncio.cpython-36m-x86_64-linux-gnu.so.old
+
+To conclude:
+- asynchronous callbacks are preferrable in most case, but do not provide a coherent cancelled status
+- implementing a version with synchronous callback (or a `synchronous_callback` parameter) is rather easy (however step 2 need to be clarified, probably a cleaner way to fix this)
+- it is totally transparent for the end user, as synchronous callback are totally compatible with asynchronous ones

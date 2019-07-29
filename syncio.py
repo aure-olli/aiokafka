@@ -1,3 +1,5 @@
+import functools
+
 from asyncio import events
 from asyncio import coroutines
 from asyncio import futures
@@ -15,6 +17,7 @@ __all__ = (
 
 class SyncFuture(futures.Future):
 
+    ### callbacks are called now instead of being scheduled ###
     def _schedule_callbacks(self):
         """Internal: Ask the event loop to call all callbacks.
         The callbacks are scheduled to be called as soon as possible. Also
@@ -29,10 +32,9 @@ class SyncFuture(futures.Future):
         for callback in callbacks:
             handle = events.Handle(callback, [self], self._loop)
             handle._run()
-            # callback(self)
-            # self._loop.call_now(callback, self)
 
 
+### Inherits from SyncFuture for its callback mechanism ###
 class SyncTask(tasks.Task, SyncFuture):
 
     def _step(self, exc=None):
@@ -117,6 +119,7 @@ class SyncTask(tasks.Task, SyncFuture):
                     RuntimeError(
                         'Task got bad yield: {!r}'.format(result)))
         finally:
+            ### fix KeyError with SyncFuture ###
             self.__class__._current_tasks.pop(self._loop, None)
             self = None  # Needed to break cycles when an exception occurs.
 
@@ -130,7 +133,7 @@ def ensure_sync_future(coro_or_future, *, loop=None):
     if coroutines.iscoroutine(coro_or_future):
         if loop is None:
             loop = events.get_event_loop()
-        # task = loop.create_sync_task(coro_or_future)
+        ### use SyncTask instead of loop.ensure_future ###
         task = SyncTask(coro_or_future, loop=loop)
         if task._source_traceback:
             del task._source_traceback[-1]
@@ -159,6 +162,7 @@ async def sync_wait(fs, *, loop=None, timeout=None, return_when=tasks.ALL_COMPLE
     if loop is None:
         loop = events.get_event_loop()
 
+    ### use ensure_sync_future instead of ensure_future ###
     fs = {ensure_sync_future(f, loop=loop) for f in set(fs)}
 
     return await _sync_wait(fs, timeout, return_when, loop)
@@ -169,7 +173,7 @@ def _release_waiter(waiter, *args):
         waiter.set_result(None)
 
 
-def sync_wait_for(fut, timeout, *, loop=None):
+async def sync_wait_for(fut, timeout, *, loop=None):
     """Wait for the single Future or coroutine to complete, with timeout.
     Coroutine will be wrapped in Task.
     Returns result of the Future or coroutine.  When a timeout occurs,
@@ -182,19 +186,20 @@ def sync_wait_for(fut, timeout, *, loop=None):
         loop = events.get_event_loop()
 
     if timeout is None:
-        return (yield from fut)
+        return await fut
 
     waiter = SyncFuture(loop=loop)
     timeout_handle = loop.call_later(timeout, _release_waiter, waiter)
     cb = functools.partial(_release_waiter, waiter)
 
+    ### use ensure_sync_future instead of ensure_future ###
     fut = ensure_sync_future(fut, loop=loop)
     fut.add_done_callback(cb)
 
     try:
         # wait until the future completes or the timeout
         try:
-            yield from waiter
+            await waiter
         except futures.CancelledError:
             fut.remove_done_callback(cb)
             fut.cancel()
@@ -215,6 +220,7 @@ async def _sync_wait(fs, timeout, return_when, loop):
     The fs argument must be a collection of Futures.
     """
     assert fs, 'Set of Futures is empty.'
+    ### use SyncFuture instead of loop.create_future ###
     waiter = SyncFuture(loop=loop)
     timeout_handle = None
     if timeout is not None:
@@ -252,6 +258,7 @@ async def _sync_wait(fs, timeout, return_when, loop):
     return done, pending
 
 
+### inherits from SyncFuture ###
 class _GatheringFuture(SyncFuture):
     """Helper for gather().
     This overrides cancel() to cancel all the children and act more
@@ -303,6 +310,7 @@ def sync_gather(*coros_or_futures, loop=None, return_exceptions=False):
     if not coros_or_futures:
         if loop is None:
             loop = events.get_event_loop()
+        ### use SyncFuture instead of loop.create_future ###
         outer = SyncFuture(loop=loop)
         outer.set_result([])
         return outer
@@ -310,6 +318,7 @@ def sync_gather(*coros_or_futures, loop=None, return_exceptions=False):
     arg_to_fut = {}
     for arg in set(coros_or_futures):
         if not futures.isfuture(arg):
+            ### use ensure_sync_future instead of ensure_future ###
             fut = ensure_sync_future(arg, loop=loop)
             if loop is None:
                 loop = fut._loop
@@ -363,7 +372,7 @@ def sync_gather(*coros_or_futures, loop=None, return_exceptions=False):
     return outer
 
 
-def synnc_shield(arg, *, loop=None):
+def sync_shield(arg, *, loop=None):
     """Wait for a future, shielding it from cancellation.
     The statement
         res = yield from shield(something())
@@ -382,11 +391,13 @@ def synnc_shield(arg, *, loop=None):
         except CancelledError:
             res = None
     """
-    inner = sync_ensure_future(arg, loop=loop)
+    ### use ensure_sync_future instead of ensure_future ###
+    inner = ensure_sync_future(arg, loop=loop)
     if inner.done():
         # Shortcut.
         return inner
     loop = inner._loop
+    ### use SyncFuture instead of loop.create_future ###
     outer = SyncFuture(loop=loop)
 
     def _done_callback(inner):
