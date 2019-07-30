@@ -30,17 +30,17 @@ import syncio
 loop = asyncio.get_event_loop()
 
 data = []
-fut_data = asyncio.Future()
+fut_data = syncio.SyncFuture()
 
 async def get_data():
     while not data:
-        await asyncio.shield(fut_data)
+        await syncio.sync_shield(fut_data)
     return data.pop()
 
 fut_wapper = asyncio.Future()
 
 async def wrapper_data():
-    task = asyncio.ensure_sync_future(get_data())
+    task = syncio.ensure_sync_future(get_data())
     return await task
 
 async def test():

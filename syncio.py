@@ -15,7 +15,7 @@ __all__ = (
 )
 
 
-class SyncFuture(futures.Future):
+class SyncFuture(futures._PyFuture):
 
     ### callbacks are called now instead of being scheduled ###
     def _schedule_callbacks(self):
@@ -35,7 +35,7 @@ class SyncFuture(futures.Future):
 
 
 ### Inherits from SyncFuture for its callback mechanism ###
-class SyncTask(tasks.Task, SyncFuture):
+class SyncTask(tasks._PyTask, SyncFuture):
 
     def _step(self, exc=None):
         assert not self.done(), \
@@ -46,8 +46,6 @@ class SyncTask(tasks.Task, SyncFuture):
             self._must_cancel = False
         coro = self._coro
         self._fut_waiter = None
-
-        print ('self.__class__._current_tasks[self._loop] = self', self)
         self.__class__._current_tasks[self._loop] = self
         # Call either coro.throw(exc) or coro.send(None).
         try:
@@ -120,13 +118,11 @@ class SyncTask(tasks.Task, SyncFuture):
                     RuntimeError(
                         'Task got bad yield: {!r}'.format(result)))
         finally:
-            ### fix KeyError with SyncFuture ###
-            print ('self.__class__._current_tasks.pop(self._loop)', self)
-            self.__class__._current_tasks.pop(self._loop)
-            # self.__class__._current_tasks.pop(self._loop, None)
+            ### fix KeyError when using SyncFuture ###
+            self.__class__._current_tasks.pop(self._loop, None)
             self = None  # Needed to break cycles when an exception occurs.
 
-tasks.Task._step = SyncTask._step
+tasks._PyTask._step = SyncTask._step
 
 
 def ensure_sync_future(coro_or_future, *, loop=None):
