@@ -6,13 +6,10 @@ import enum
 import warnings
 
 from aiokafka.client import AIOKafkaClient
-from aiokafka.consumer import AIOKafkaConsumer
 from .protocol import (
     CreateTopicsRequest, ApplicationConsumerProtocolMetadata, ApplicationConsumerProtocolAssignment, ApplicationConsumerProtocol)
 from kafka.protocol.metadata import MetadataRequest
 from kafka.common import TopicPartition
-from kafka.coordinator.protocol import (
-    ConsumerProtocolMemberMetadata, ConsumerProtocolMemberAssignment)
 from aiokafka.abc import ConsumerRebalanceListener
 from kafka.partitioner.default import DefaultPartitioner
 from aiokafka.util import (
@@ -25,13 +22,11 @@ from aiokafka.errors import (
     MessageSizeTooLargeError, UnsupportedVersionError, IllegalOperation)
 from kafka.codec import has_gzip, has_snappy, has_lz4
 from aiokafka.record.legacy_records import LegacyRecordBatchBuilder
-from aiokafka.consumer.subscription_state import SubscriptionState
-from aiokafka.consumer.fetcher import Fetcher
-from aiokafka.consumer.group_coordinator import GroupCoordinator, NoGroupCoordinator
 
 from .tasks import PartitionTask
 from .consumers import PartitionableConsumer
 from .producers import PartitionableProducer
+from .utils import ClientConsumer, RestorationConsumer
 
 from aiokafka.errors import (
     NotControllerError,
@@ -87,167 +82,6 @@ class TopicConfig:
         if self._config: config.update(self._config)
         return (self._topic, partitions, replicas,
                 [], list(config.items()))
-
-
-class _AIOKafkaConsumer(AIOKafkaConsumer):
-
-    def __init__(self, loop, client,
-                 group_id=None,
-                 fetch_max_wait_ms=500,
-                 fetch_max_bytes=52428800,
-                 fetch_min_bytes=1,
-                 max_partition_fetch_bytes=1 * 1024 * 1024,
-                 request_timeout_ms=40 * 1000,
-                 retry_backoff_ms=100,
-                 auto_offset_reset='latest',
-                 enable_auto_commit=True,
-                 auto_commit_interval_ms=5000,
-                 check_crcs=True,
-                 partition_assignment_strategy=(),
-                 consumer_protocol=None,
-                 max_poll_interval_ms=300000,
-                 rebalance_timeout_ms=None,
-                 session_timeout_ms=10000,
-                 heartbeat_interval_ms=3000,
-                 consumer_timeout_ms=200,
-                 max_poll_records=None,
-                 max_poll_records_per_partition=None,
-                 exclude_internal_topics=True,
-                 isolation_level="read_uncommitted"):
-        if max_poll_records is not None and (
-                not isinstance(max_poll_records, int) or max_poll_records < 1):
-            raise ValueError("`max_poll_records` should be positive Integer")
-        if max_poll_records_per_partition is not None and (
-                not isinstance(max_poll_records_per_partition, int) or
-                        max_poll_records_per_partition < 1):
-            raise ValueError("`max_poll_records_per_partition` should be "
-                "positive Integer")
-
-        if rebalance_timeout_ms is None:
-            rebalance_timeout_ms = session_timeout_ms
-
-        self._client = client
-
-        self._group_id = group_id
-        self._heartbeat_interval_ms = heartbeat_interval_ms
-        self._session_timeout_ms = session_timeout_ms
-        self._retry_backoff_ms = retry_backoff_ms
-        self._auto_offset_reset = auto_offset_reset
-        self._request_timeout_ms = request_timeout_ms
-        self._enable_auto_commit = enable_auto_commit
-        self._auto_commit_interval_ms = auto_commit_interval_ms
-        self._partition_assignment_strategy = partition_assignment_strategy
-        self._consumer_protocol = consumer_protocol
-        self._key_deserializer = None
-        self._value_deserializer = None
-        self._fetch_min_bytes = fetch_min_bytes
-        self._fetch_max_bytes = fetch_max_bytes
-        self._fetch_max_wait_ms = fetch_max_wait_ms
-        self._max_partition_fetch_bytes = max_partition_fetch_bytes
-        self._exclude_internal_topics = exclude_internal_topics
-        self._max_poll_records = max_poll_records
-        self._max_poll_records_per_partition = max_poll_records_per_partition
-        self._consumer_timeout = consumer_timeout_ms / 1000
-        self._isolation_level = isolation_level
-        self._rebalance_timeout_ms = rebalance_timeout_ms
-        self._max_poll_interval_ms = max_poll_interval_ms
-
-        self._check_crcs = check_crcs
-        self._subscription = SubscriptionState(loop=loop)
-        self._fetcher = None
-        self._coordinator = None
-        self._loop = loop
-
-        if loop.get_debug():
-            self._source_traceback = traceback.extract_stack(sys._getframe(1))
-        self._closed = False
-
-    async def start(self):
-        """ Connect to Kafka cluster. This will:
-
-            * Load metadata for all cluster nodes and partition allocation
-            * Wait for possible topic autocreation
-            * Join group if ``group_id`` provided
-        """
-        assert self._fetcher is None, "Did you call `start` twice?"
-        await self._wait_topics()
-
-        if self._client.api_version < (0, 9):
-            raise ValueError("Unsupported Kafka version: {}".format(
-                self._client.api_version))
-
-        if self._isolation_level == "read_committed" and \
-                self._client.api_version < (0, 11):
-            raise UnsupportedVersionError(
-                "`read_committed` isolation_level available only for Brokers "
-                "0.11 and above")
-
-        self._fetcher = Fetcher(
-            self._client, self._subscription, loop=self._loop,
-            key_deserializer=self._key_deserializer,
-            value_deserializer=self._value_deserializer,
-            fetch_min_bytes=self._fetch_min_bytes,
-            fetch_max_bytes=self._fetch_max_bytes,
-            fetch_max_wait_ms=self._fetch_max_wait_ms,
-            max_partition_fetch_bytes=self._max_partition_fetch_bytes,
-            check_crcs=self._check_crcs,
-            fetcher_timeout=self._consumer_timeout,
-            retry_backoff_ms=self._retry_backoff_ms,
-            auto_offset_reset=self._auto_offset_reset,
-            isolation_level=self._isolation_level)
-
-        if self._group_id is not None:
-            # using group coordinator for automatic partitions assignment
-            self._coordinator = GroupCoordinator(
-                self._client, self._subscription, loop=self._loop,
-                group_id=self._group_id,
-                heartbeat_interval_ms=self._heartbeat_interval_ms,
-                session_timeout_ms=self._session_timeout_ms,
-                retry_backoff_ms=self._retry_backoff_ms,
-                enable_auto_commit=self._enable_auto_commit,
-                auto_commit_interval_ms=self._auto_commit_interval_ms,
-                assignors=self._partition_assignment_strategy,
-                consumer_protocol=self._consumer_protocol,
-                exclude_internal_topics=self._exclude_internal_topics,
-                rebalance_timeout_ms=self._rebalance_timeout_ms,
-                max_poll_interval_ms=self._max_poll_interval_ms
-            )
-            if self._subscription.subscription is not None:
-                if self._subscription.partitions_auto_assigned():
-                    # Either we passed `topics` to constructor or `subscribe`
-                    # was called before `start`
-                    await self._subscription.wait_for_assignment()
-                else:
-                    # `assign` was called before `start`. We did not start
-                    # this task on that call, as coordinator was yet to be
-                    # created
-                    self._coordinator.start_commit_offsets_refresh_task(
-                        self._subscription.subscription.assignment)
-        else:
-            # Using a simple assignment coordinator for reassignment on
-            # metadata changes
-            self._coordinator = NoGroupCoordinator(
-                self._client, self._subscription, loop=self._loop,
-                exclude_internal_topics=self._exclude_internal_topics)
-
-            if self._subscription.subscription is not None:
-                if self._subscription.partitions_auto_assigned():
-                    # Either we passed `topics` to constructor or `subscribe`
-                    # was called before `start`
-                    await self._client.force_metadata_update()
-                    self._coordinator.assign_all_partitions(check_unknown=True)
-
-    def create_poll_waiter(self):
-        return self._fetcher.create_poll_waiter()
-
-    def consumed_offsets(self):
-        subscription = self._subscription.subscription
-        if subscription is None:
-            return None
-        assignment = subscription.assignment
-        if assignment is None:
-            return None
-        return assignment.all_consumed_offsets()
 
 
 class Assignator:
@@ -470,20 +304,15 @@ class AIOKafkaApplication(object):
             request_timeout_ms=request_timeout_ms,
             loop=loop)
 
-        self.consumer = _AIOKafkaConsumer(
-            loop=loop, client=self.client,
-            group_id=group_id,
+        self._consumer_options = dict(
             fetch_max_wait_ms=fetch_max_wait_ms,
             fetch_max_bytes=fetch_max_bytes,
             fetch_min_bytes=fetch_min_bytes,
             max_partition_fetch_bytes=max_partition_fetch_bytes,
             request_timeout_ms=request_timeout_ms,
             retry_backoff_ms=retry_backoff_ms,
-            auto_offset_reset=auto_offset_reset,
             enable_auto_commit=False,
-            # auto_commit_interval_ms=auto_commit_interval_ms,
             check_crcs=check_crcs,
-            partition_assignment_strategy=partition_assignment_strategy,
             consumer_protocol=consumer_protocol,
             max_poll_interval_ms=max_poll_interval_ms,
             rebalance_timeout_ms=rebalance_timeout_ms,
@@ -492,8 +321,15 @@ class AIOKafkaApplication(object):
             consumer_timeout_ms=consumer_timeout_ms,
             max_poll_records=max_poll_records,
             max_poll_records_per_partition=max_poll_records_per_partition,
-            exclude_internal_topics=exclude_internal_topics,
+        )
+        self.consumer = ClientConsumer(
+            loop=loop, client=self.client,
+            group_id=group_id,
+            auto_offset_reset=auto_offset_reset,
+            partition_assignment_strategy=partition_assignment_strategy,
+            # exclude_internal_topics=exclude_internal_topics,
             isolation_level=isolation_level,
+            **self._consumer_options,
         )
         self._enable_auto_commit = enable_auto_commit
         self._auto_commit_interval_ms = auto_commit_interval_ms
@@ -510,9 +346,10 @@ class AIOKafkaApplication(object):
         self._tasks = set()
         self._group_id = group_id
         self._auto_commit_task = None
-
         self._join_task = None
         self._commit_task = None
+        self._restoration_consumer = None
+        self._restoration_streams = []
 
         self._loop = loop
         if loop.get_debug():
@@ -671,6 +508,33 @@ class AIOKafkaApplication(object):
         self.group(*topics)
         return PartitionableProducer(self, topics)
 
+    async def _start_restoration_consumer(self):
+        await asyncio.sleep(0.01)
+        consumer = self._restoration_consumer[0]
+        self._restoration_consumer = None
+        await consumer.start()
+
+    async def _stop_restoration_streams(self):
+        streams = self._restoration_streams
+        self._restoration_streams = []
+        await asyncio.wait([stream.stop() for stream in streams])
+
+    def restoration_stream(self, *partitions):
+        if not self._restoration_consumer:
+            consumer = RestorationConsumer(
+                loop=self._loop, client=self.client,
+                auto_offset_reset='earliset',
+                isolation_level='read_committed',
+                **self._consumer_options,
+            )
+            task = self._loop.ensure_future(self._start_restoration_consumer())
+            self._restoration_consumer = (consumer, task)
+        else:
+            consumer = self._restoration_consumer[0]
+        stream = consumer.restoration_stream(*partitions)
+        self._restoration_streams.append(stream)
+        return stream
+
     async def commit(self):
         if not self.assigned: raise Exception('rebalancing')
         if not self._commit_task:
@@ -699,6 +563,7 @@ class AIOKafkaApplication(object):
         if self._tasks:
             await asyncio.wait([
                     task.after_rebalance(assigned) for task in self._tasks])
+        await self._stop_restoration_streams()
         if not self._auto_commit_task:
             self._auto_commit_task = asyncio.ensure_future(
                     self._do_auto_commit())

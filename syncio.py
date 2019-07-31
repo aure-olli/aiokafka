@@ -63,7 +63,8 @@ class SyncTask(tasks._PyTask, SyncFuture):
             else:
                 self.set_result(exc.value)
         except futures.CancelledError:
-            super().cancel()  # I.e., Future.cancel(self).
+            ### be sure to call SyncFuture.cancel ###
+            super(tasks._PyTask, self).cancel()  # I.e., Future.cancel(self).
         except Exception as exc:
             self.set_exception(exc)
         except BaseException as exc:
@@ -122,6 +123,7 @@ class SyncTask(tasks._PyTask, SyncFuture):
             self.__class__._current_tasks.pop(self._loop, None)
             self = None  # Needed to break cycles when an exception occurs.
 
+### patch tasks._PyTask too ##
 tasks._PyTask._step = SyncTask._step
 
 

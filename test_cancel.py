@@ -189,3 +189,52 @@ async def test():
 
 loop = asyncio.get_event_loop()
 loop.run_until_complete(test())
+
+
+
+import asyncio
+import syncio
+
+available_data = []
+data_ready = asyncio.Future()
+
+def feed_data(data):
+    global data_ready
+    available_data.append(data)
+    data_ready.set_result(None)
+    data_ready = asyncio.Future()
+
+async def consume_data():
+    while not available_data:
+        await asyncio.shield(data_ready)
+    return available_data.pop()
+
+async def wrapped_consumer():
+    task = syncio.ensure_sync_future(consume_data())
+    return await task
+
+stop_future = asyncio.Future()
+async def wrapped_consumer2():
+    task = syncio.ensure_sync_future(consume_data())
+    try:
+        await syncio.sync_wait([task, stop_future],
+                return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        task.cancel()
+    if not task.cancelled():
+        return task.result()
+    else:
+        raise RuntimeError('stopped')
+
+async def test():
+    task = asyncio.ensure_future(wrapped_consumer2())
+    await asyncio.sleep(0)
+    task.cancel()
+    # await asyncio.sleep(0)
+    feed_data('data')
+    await asyncio.sleep(0)
+    print ('task', task)
+    print ('available_data', available_data)
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(test())
