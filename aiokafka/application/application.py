@@ -226,7 +226,8 @@ class AIOKafkaApplication(object):
             sasl_plain_username=None,
             sasl_kerberos_service_name='kafka',
             sasl_kerberos_domain_name=None,
-            create_topic_timeout_ms=600000):
+            create_topic_timeout_ms=60000,
+            create_topic_refresh_ms=100):
 
         if partition_assignment_strategy is None:
             partition_assignment_strategy = (Assignator(self),)
@@ -335,6 +336,7 @@ class AIOKafkaApplication(object):
         self._auto_commit_interval_ms = auto_commit_interval_ms
 
         self._create_topic_timeout_ms = create_topic_timeout_ms
+        self._create_topic_refresh = create_topic_refresh_ms / 1000
         self._subscriptions = set()
         self._equipartitioned = list()
         self._topic_configs = {}
@@ -445,14 +447,18 @@ class AIOKafkaApplication(object):
                     partitions = len(partitions)
             topics.append(self._topic_configs[topic].request(partitions))
 
+        print ('create', topics)
         if self.client.api_version < (0, 10):
             request = CreateTopicsRequest[0](topics,
                     self._create_topic_timeout_ms)
         else:
             request = CreateTopicsRequest[1](topics,
                     self._create_topic_timeout_ms, False)
-        response = await self.client.send(node_id, request,
-                timeout=self._create_topic_timeout_ms / 1000)
+
+        timeout = self._create_topic_timeout_ms / 1000
+        start_time = self._loop.time()
+        response = await self.client.send(node_id, request, timeout=timeout)
+        timeout -= self._loop.time() - start_time
 
         for topic, code, reason in response.topic_errors:
             if code != 0:
@@ -464,24 +470,38 @@ class AIOKafkaApplication(object):
                     raise for_code(code)(
                         f'Cannot create topic: {topic} ({code}): {reason}')
 
-        if self.client.api_version < (0, 10):
-            metadata_request = MetadataRequest[0]([])
-        else:
-            metadata_request = MetadataRequest[1]([])
-        metadata = await self.client.send(node_id, metadata_request,
-                timeout=self._create_topic_timeout_ms / 1000)
-        self.client.cluster.update_metadata(metadata)
+        while timeout > 0:
+            start_time = self._loop.time()
 
-        for topic in self._topics:
-            partitions = self.client.cluster.partitions_for_topic(topic)
-            if partitions is None:
-                raise RuntimeError(f'No topic {topic}')
-            elif topic in topic_group:
-                group = topic_group[topic]
-                if group_partitions[group] is None:
-                    group_partitions[group] = partitions
-                elif group_partitions[group] != partitions:
-                    raise RuntimeError('different partitions')
+            if self.client.api_version < (0, 10):
+                metadata_request = MetadataRequest[0]([])
+            else:
+                metadata_request = MetadataRequest[1]([])
+            metadata = await self.client.send(
+                    node_id, metadata_request, timeout=timeout)
+            self.client.cluster.update_metadata(metadata)
+
+            for topic in self._topics:
+                partitions = self.client.cluster.partitions_for_topic(topic)
+                if partitions is None:
+                    break
+                elif topic in topic_group:
+                    group = topic_group[topic]
+                    if group_partitions[group] is None:
+                        group_partitions[group] = partitions
+                    elif group_partitions[group] != partitions:
+                        raise RuntimeError('different partitions')
+            else:
+                break
+
+            ellapsed = self._loop.time() - start_time
+            timeout -= ellapsed
+            sleep = min(timeout, self._create_topic_refresh - ellapsed)
+            if sleep <= 0:
+                await asyncio.sleep(sleep)
+                timeout -= sleep
+        else:
+            raise RuntimeError('cannot create topic')
 
     def register_task(self, stream):
         self._tasks.add(stream)
@@ -490,7 +510,7 @@ class AIOKafkaApplication(object):
         self._tasks.remove(stream)
 
     def group(self, *topics):
-        if len(topics) > 1:
+        if len(topics):
             self._equipartitioned.append(set(topics))
 
     def subscribe(self, *topics):
@@ -508,6 +528,10 @@ class AIOKafkaApplication(object):
         self.group(*topics)
         return PartitionableProducer(self, topics)
 
+    def partitionable_table(self, topic):
+        self.group(topic)
+        return PartitionableMemoryTable(self, topic)
+
     async def _start_restoration_consumer(self):
         await asyncio.sleep(0.01)
         consumer = self._restoration_consumer[0]
@@ -517,7 +541,8 @@ class AIOKafkaApplication(object):
     async def _stop_restoration_streams(self):
         streams = self._restoration_streams
         self._restoration_streams = []
-        await asyncio.wait([stream.stop() for stream in streams])
+        if streams:
+            await asyncio.wait([stream.stop() for stream in streams])
 
     def restoration_stream(self, *partitions):
         if not self._restoration_consumer:
