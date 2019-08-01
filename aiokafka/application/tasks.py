@@ -141,9 +141,7 @@ class PartitionTask(AbstractTask):
 
     async def before_rebalance(self, revoked):
         # commit if not already done
-        print ('before_rebalance a')
         await self.before_commit()
-        print ('before_rebalance b')
         # already rebalancing
         if self._state is TaskState.REBALANCE:
             return
@@ -154,11 +152,8 @@ class PartitionTask(AbstractTask):
             self._task = None
             if task and not task.done():
                 task.cancel()
-                print ('before_rebalance c')
-                task.print_stack()
                 await asyncio.wait([task])
         else: raise RuntimeError('state ??? ' + self._state.name)
-        print ('before_rebalance d')
 
     async def after_rebalance(self, assigned):
         # not started yet, don't start anything
@@ -250,27 +245,34 @@ class PartitionTask(AbstractTask):
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def stop(self):
+        print ('stop a')
         # already closed or not even started
         if self._state in (TaskState.INIT, TaskState.CLOSED):
             self._state = TaskState.CLOSED
             return
 
+        print ('stop b')
         try: self._app.unregister_task(self)
         except: log.error(
                 'Exception when unregistering the task', exc_info=True)
         # one last commit
+        print ('stop c')
         try: await self.before_commit()
         except: log.error(
                 'Exception when committing the task', exc_info=True)
         # check that the state makes sense
+        print ('stop d')
         if self._state not in (
                 TaskState.WAIT, TaskState.COMMIT, TaskState.REBALANCE):
             log.error('Unexpected state %s on closing', self._state.name)
         self._state = TaskState.CLOSED
         # cancel the task
+        print ('stop e')
         if self._task and not self._task.done():
+            self._task.print_stack()
             self._task.cancel()
             await asyncio.wait([self._task])
+        print ('stop f')
 
     async def _run(self):
         """The main coroutine"""
@@ -305,14 +307,12 @@ class PartitionTask(AbstractTask):
         try:
             if pargs:
                 tasks = [asyncio.ensure_future(arg.start()) for arg in pargs]
-                print ('_run 1')
-                await asyncio.gather(*tasks)
+                await asyncio.wait(tasks)
 
             # TODO : stop  pargs of a task once finished
             tasks = [asyncio.ensure_future(self._fun(*kargs, **kwargs))
                     for kargs, kwargs in args.values()]
-            print ('_run 2', tasks)
-            await asyncio.gather(*tasks)
+            await asyncio.wait(tasks)
         # cancel everything and close the partition arguments
         except asyncio.CancelledError:
             raise
@@ -320,14 +320,10 @@ class PartitionTask(AbstractTask):
             log.error('Exception while running the tasks', exc_info=True)
             raise
         finally:
-            print ('_run 3')
             self._pargs = None
             if tasks:
                 for task in tasks:
-                    if not task.done(): task.cancel()
-                print ('_run 4')
+                    task.cancel()
                 await asyncio.wait(tasks)
             if pargs:
-                print ('_run 5')
                 await asyncio.wait([arg.stop() for arg in pargs])
-            print ('_run 6')

@@ -280,9 +280,10 @@ class AIOKafkaApplication(object):
         self._max_request_size = max_request_size
         self._request_timeout_ms = request_timeout_ms
 
-        self.client = AIOKafkaClient(
-            loop=loop, bootstrap_servers=bootstrap_servers,
-            client_id=client_id, metadata_max_age_ms=metadata_max_age_ms,
+        self._client_options = dict(
+            bootstrap_servers=bootstrap_servers,
+            client_id=client_id,
+            metadata_max_age_ms=metadata_max_age_ms,
             request_timeout_ms=request_timeout_ms,
             retry_backoff_ms=retry_backoff_ms,
             api_version=api_version,
@@ -293,7 +294,12 @@ class AIOKafkaApplication(object):
             sasl_plain_username=sasl_plain_username,
             sasl_plain_password=sasl_plain_password,
             sasl_kerberos_service_name=sasl_kerberos_service_name,
-            sasl_kerberos_domain_name=sasl_kerberos_domain_name)
+            sasl_kerberos_domain_name=sasl_kerberos_domain_name,
+        )
+        self.client = AIOKafkaClient(
+            loop=loop,
+            **self._client_options,
+        )
         self._metadata = self.client.cluster
         self._message_accumulator = MessageAccumulator(
             self._metadata, max_batch_size, compression_attrs,
@@ -547,12 +553,14 @@ class AIOKafkaApplication(object):
 
     def restoration_stream(self, *partitions):
         if not self._restoration_consumer:
-            consumer = RestorationConsumer(
-                loop=self._loop, client=self.client,
+            options = dict(
+                loop=self._loop,
                 auto_offset_reset='earliest',
                 isolation_level='read_committed',
-                **self._consumer_options,
             )
+            options.update(self._consumer_options)
+            options.update(self._client_options)
+            consumer = RestorationConsumer(**options)
             task = self._loop.create_task(self._start_restoration_consumer())
             self._restoration_consumer = (consumer, task)
         else:
@@ -575,11 +583,9 @@ class AIOKafkaApplication(object):
         if not self._join_task:
             self._join_task = asyncio.ensure_future(self._do_join())
         if self._tasks:
-            print ('before_rebalance 1')
             await asyncio.wait([self._join_task] +
                     [task.before_rebalance(revoked) for task in self._tasks])
-            print ('before_rebalance 2')
-        # await self._stop_restoration_streams()
+        await self._stop_restoration_streams()
         self._offsets.clear()
         self._commits.clear()
 
@@ -709,11 +715,11 @@ class AIOKafkaApplication(object):
 
         await self.consumer.start()
 
-        self.assigned = True
-        self.ready = True
-        if not self._auto_commit_task:
-            self._auto_commit_task = asyncio.ensure_future(
-                    self._do_auto_commit())
+        # self.assigned = True
+        # self.ready = True
+        # if not self._auto_commit_task:
+        #     self._auto_commit_task = asyncio.ensure_future(
+        #             self._do_auto_commit())
         print ('start end')
 
     async def flush(self):

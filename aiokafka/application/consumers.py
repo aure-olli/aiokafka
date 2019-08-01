@@ -212,7 +212,12 @@ class PartitionConsumer(PartitionArgument):
                 return await asyncio.sleep(timeout)
             else:
                 return None
-        finally:
+        except asyncio.CancelledError:
+            raise
+        except:
+            await self.pause()
+            raise
+        else:
             await self.pause()
         update = list(filter(lambda task: task.done(), pending))
         done.update(update)
