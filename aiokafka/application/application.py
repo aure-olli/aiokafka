@@ -27,6 +27,7 @@ from .tasks import PartitionTask
 from .consumers import PartitionableConsumer
 from .producers import PartitionableProducer
 from .utils import ClientConsumer, RestorationConsumer
+from .tables import PartitionableMemoryTable
 
 from aiokafka.errors import (
     NotControllerError,
@@ -159,7 +160,7 @@ class RebalanceListener(ConsumerRebalanceListener):
     async def on_partitions_revoked(self, revoked):
         print ('on_partitions_revoked begin')
         await self._app.before_rebalance(revoked)
-        print ('on_partitions_revoked')
+        print ('on_partitions_revoked end')
 
     async def on_partitions_assigned(self, assigned):
         print ('on_partitions_assigned')
@@ -548,11 +549,11 @@ class AIOKafkaApplication(object):
         if not self._restoration_consumer:
             consumer = RestorationConsumer(
                 loop=self._loop, client=self.client,
-                auto_offset_reset='earliset',
+                auto_offset_reset='earliest',
                 isolation_level='read_committed',
                 **self._consumer_options,
             )
-            task = self._loop.ensure_future(self._start_restoration_consumer())
+            task = self._loop.create_task(self._start_restoration_consumer())
             self._restoration_consumer = (consumer, task)
         else:
             consumer = self._restoration_consumer[0]
@@ -574,8 +575,11 @@ class AIOKafkaApplication(object):
         if not self._join_task:
             self._join_task = asyncio.ensure_future(self._do_join())
         if self._tasks:
+            print ('before_rebalance 1')
             await asyncio.wait([self._join_task] +
                     [task.before_rebalance(revoked) for task in self._tasks])
+            print ('before_rebalance 2')
+        # await self._stop_restoration_streams()
         self._offsets.clear()
         self._commits.clear()
 
@@ -588,7 +592,6 @@ class AIOKafkaApplication(object):
         if self._tasks:
             await asyncio.wait([
                     task.after_rebalance(assigned) for task in self._tasks])
-        await self._stop_restoration_streams()
         if not self._auto_commit_task:
             self._auto_commit_task = asyncio.ensure_future(
                     self._do_auto_commit())
@@ -962,9 +965,6 @@ class AIOKafkaApplication(object):
         return TransactionContext(self)
 
     async def send_offsets_to_transaction(self, offsets, group_id):
-        print ('send_offsets_to_transaction',
-                [(tp.topic, tp.partition, offset)
-                for tp, offset in offsets.items()])
         self._ensure_transactional()
 
         if not self._txn_manager.is_in_transaction():
@@ -981,4 +981,3 @@ class AIOKafkaApplication(object):
             formatted_offsets, group_id)
         fut = self._txn_manager.add_offsets_to_txn(formatted_offsets, group_id)
         await asyncio.shield(fut, loop=self._loop)
-        print ('send_offsets_to_transaction end')

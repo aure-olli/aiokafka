@@ -141,7 +141,9 @@ class PartitionTask(AbstractTask):
 
     async def before_rebalance(self, revoked):
         # commit if not already done
+        print ('before_rebalance a')
         await self.before_commit()
+        print ('before_rebalance b')
         # already rebalancing
         if self._state is TaskState.REBALANCE:
             return
@@ -152,8 +154,11 @@ class PartitionTask(AbstractTask):
             self._task = None
             if task and not task.done():
                 task.cancel()
+                print ('before_rebalance c')
+                task.print_stack()
                 await asyncio.wait([task])
         else: raise RuntimeError('state ??? ' + self._state.name)
+        print ('before_rebalance d')
 
     async def after_rebalance(self, assigned):
         # not started yet, don't start anything
@@ -300,11 +305,13 @@ class PartitionTask(AbstractTask):
         try:
             if pargs:
                 tasks = [asyncio.ensure_future(arg.start()) for arg in pargs]
+                print ('_run 1')
                 await asyncio.gather(*tasks)
 
             # TODO : stop  pargs of a task once finished
             tasks = [asyncio.ensure_future(self._fun(*kargs, **kwargs))
                     for kargs, kwargs in args.values()]
+            print ('_run 2', tasks)
             await asyncio.gather(*tasks)
         # cancel everything and close the partition arguments
         except asyncio.CancelledError:
@@ -313,10 +320,14 @@ class PartitionTask(AbstractTask):
             log.error('Exception while running the tasks', exc_info=True)
             raise
         finally:
+            print ('_run 3')
             self._pargs = None
             if tasks:
                 for task in tasks:
                     if not task.done(): task.cancel()
+                print ('_run 4')
                 await asyncio.wait(tasks)
             if pargs:
+                print ('_run 5')
                 await asyncio.wait([arg.stop() for arg in pargs])
+            print ('_run 6')
