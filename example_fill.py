@@ -8,7 +8,7 @@ from aiokafka.producer import AIOKafkaProducer
 topics = ('test1', 'test2', 'test3', 'test4', 'test5')
 producer = AIOKafkaProducer(loop=loop, max_request_size=10000)
 loop.run_until_complete(producer.start())
-for i in range(5000):
+for i in range(50000):
 	if i % 100 == 0:
 		print (i)
 	topic = random.choice(topics)

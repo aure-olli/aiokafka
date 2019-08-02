@@ -245,34 +245,27 @@ class PartitionTask(AbstractTask):
         else: raise RuntimeError('state ??? ' + self._state.name)
 
     async def stop(self):
-        print ('stop a')
         # already closed or not even started
         if self._state in (TaskState.INIT, TaskState.CLOSED):
             self._state = TaskState.CLOSED
             return
 
-        print ('stop b')
         try: self._app.unregister_task(self)
         except: log.error(
                 'Exception when unregistering the task', exc_info=True)
         # one last commit
-        print ('stop c')
         try: await self.before_commit()
         except: log.error(
                 'Exception when committing the task', exc_info=True)
         # check that the state makes sense
-        print ('stop d')
         if self._state not in (
                 TaskState.WAIT, TaskState.COMMIT, TaskState.REBALANCE):
             log.error('Unexpected state %s on closing', self._state.name)
         self._state = TaskState.CLOSED
         # cancel the task
-        print ('stop e')
         if self._task and not self._task.done():
-            self._task.print_stack()
             self._task.cancel()
             await asyncio.wait([self._task])
-        print ('stop f')
 
     async def _run(self):
         """The main coroutine"""
@@ -292,28 +285,24 @@ class PartitionTask(AbstractTask):
         args = {}
         pargs = []
         for partition in partitions:
+            local_pargs = []
             def transform(arg):
                 if isinstance(arg, Partitionable):
                     arg = arg.partitionate(partition)
                     if isinstance(arg, PartitionArgument):
-                        pargs.append(arg)
+                        local_pargs.append(arg)
                 return arg
             kargs = [transform(arg) for arg in self._kargs]
             kwargs = {k: transform(arg) for k, arg in self._kwargs.items()}
-            args[partition] = (kargs, kwargs)
+            args[partition] = (local_pargs, kargs, kwargs)
+            pargs.extend(local_pargs)
         # start the partition arguments and then the tasks
         self._pargs = pargs
-        tasks = ()
+        tasks = None
         try:
-            if pargs:
-                tasks = [asyncio.ensure_future(arg.start()) for arg in pargs]
-                await asyncio.wait(tasks)
-
-            # TODO : stop  pargs of a task once finished
-            tasks = [asyncio.ensure_future(self._fun(*kargs, **kwargs))
-                    for kargs, kwargs in args.values()]
+            tasks = [asyncio.ensure_future(self._run_partition(partition, *arg))
+                    for partition, arg in args.items()]
             await asyncio.wait(tasks)
-        # cancel everything and close the partition arguments
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -321,6 +310,53 @@ class PartitionTask(AbstractTask):
             raise
         finally:
             self._pargs = None
+            if tasks:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.wait(tasks)
+            if pargs:
+                await asyncio.wait([arg.stop() for arg in pargs])
+
+        # try:
+        #     if pargs:
+        #         tasks = [asyncio.ensure_future(arg.start()) for arg in pargs]
+        #         await asyncio.wait(tasks)
+
+        #     # TODO : stop  pargs of a task once finished
+        #     tasks = [asyncio.ensure_future(self._fun(*kargs, **kwargs))
+        #             for kargs, kwargs in args.values()]
+        #     await asyncio.wait(tasks)
+        # # cancel everything and close the partition arguments
+        # except asyncio.CancelledError:
+        #     raise
+        # except Exception as e:
+        #     log.error('Exception while running the tasks', exc_info=True)
+        #     raise
+        # finally:
+        #     self._pargs = None
+        #     if tasks:
+        #         for task in tasks:
+        #             task.cancel()
+        #         await asyncio.wait(tasks)
+        #     if pargs:
+        #         await asyncio.wait([arg.stop() for arg in pargs])
+
+    async def _run_partition(self, partition, pargs, kargs, kwargs):
+        tasks = None
+        try:
+            if pargs:
+                tasks = [asyncio.ensure_future(arg.start()) for arg in pargs]
+                await asyncio.wait(tasks)
+                tasks = None
+            # TODO : stop  pargs of a task once finished
+            await asyncio.ensure_future(self._fun(*kargs, **kwargs))
+        # cancel everything and close the partition arguments
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error('Exception while running the tasks', exc_info=True)
+            raise
+        finally:
             if tasks:
                 for task in tasks:
                     task.cancel()

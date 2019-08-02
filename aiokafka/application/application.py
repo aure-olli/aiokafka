@@ -602,6 +602,23 @@ class AIOKafkaApplication(object):
             self._auto_commit_task = asyncio.ensure_future(
                     self._do_auto_commit())
 
+    async def abort(self):
+        self.assigned = False
+        self.ready = False
+        if self._auto_commit_task:
+            self._auto_commit_task.cancel()
+            self._auto_commit_task = None
+        if self._tasks:
+            await asyncio.gather(*(task.abort()
+                    for task in self._tasks))
+        if self._txn_manager:
+            await self.abort_transaction()
+        self.assigned = True
+        self.ready = True
+        if self._tasks:
+            await asyncio.gather(*(task.after_rebalance()
+                    for task in self._tasks))
+
     async def _do_join(self):
         try:
             if self._tasks:
