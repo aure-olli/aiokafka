@@ -168,6 +168,16 @@ class RebalanceListener(ConsumerRebalanceListener):
         print ('on_partitions_assigned end')
 
 
+class ApplicationState(enum.Enum):
+    INIT = enum.auto()
+    WAIT = enum.auto()
+    PROCESS = enum.auto()
+    COMMIT = enum.auto()
+    REBALANCE = enum.auto()
+    ABORT = enum.auto()
+    CLOSE = enum.auto()
+
+
 class AIOKafkaApplication(object):
     _APPLICATION_CLIENT_ID_SEQUENCE = 0
 
@@ -355,10 +365,13 @@ class AIOKafkaApplication(object):
         self._tasks = set()
         self._group_id = group_id
         self._auto_commit_task = None
-        self._join_task = None
-        self._commit_task = None
         self._restoration_consumer = None
         self._restoration_streams = []
+
+        self._join_task = None
+        self._commit_task = None
+        self._wait = None
+        self._rebalance = None
 
         self._loop = loop
         if loop.get_debug():
@@ -570,24 +583,49 @@ class AIOKafkaApplication(object):
         return stream
 
     async def commit(self):
-        if not self.assigned: raise Exception('rebalancing')
-        if not self._commit_task:
+        if self._state is ApplicationState.COMMIT:
+            await asyncio.shield(self._commit_task)
+        elif self._state is ApplicationState.INIT:
+            return
+        elif self._state is ApplicationState.PROCESS:
+            self._state = ApplicationState.COMMIT
             self._commit_task = asyncio.ensure_future(self._do_commit())
-        await asyncio.shield(self._commit_task)
+            await asyncio.shield(self._commit_task)
+        else:
+            raise RuntimeError('state ??? ' + self._state)
 
     async def before_rebalance(self, revoked):
-        self.assigned = False
-        if self._auto_commit_task:
-            self._auto_commit_task.cancel()
-            self._auto_commit_task = None
-        if not self._join_task:
-            self._join_task = asyncio.ensure_future(self._do_join())
-        if self._tasks:
-            await asyncio.wait([self._join_task] +
-                    [task.before_rebalance(revoked) for task in self._tasks])
-        await self._stop_restoration_streams()
-        self._offsets.clear()
-        self._commits.clear()
+        while True:
+            if self._state in (
+                    ApplicationState.PROCESS, ApplicationState.REBALANCE):
+                break
+            elif self._state is ApplicationState.COMMIT:
+                if self._join_task:
+                    if self._commit_task:
+                        self._commit_task.cancel()
+                        self._commit_task = None
+                    break
+                await asyncio.shield(self._commit_task)
+            else:
+                raise RuntimeError('state ??? ' + self._state)
+
+        if not self._commit_task:
+            self._commit_task = asyncio.ensure_future(
+                    self._do_brefore_rebalance())
+        return await asyncio.shield(self._commit_task)
+
+        # self.assigned = False
+        # if self._auto_commit_task:
+        #     self._auto_commit_task.cancel()
+        #     self._auto_commit_task = None
+        # if not self._join_task:
+        #     self._join_task = asyncio.ensure_future(self._do_join())
+        # if self._tasks:
+        #     await asyncio.wait([self._join_task] +
+        #             [task.before_rebalance(revoked) for task in self._tasks])
+        # await self._stop_restoration_streams()
+        # self._offsets.clear()
+        # self._commits.clear()
 
     async def after_rebalance(self, assigned):
         if self._closed: raise Exception('closed')
@@ -643,21 +681,17 @@ class AIOKafkaApplication(object):
             self._join_task = None
 
     async def _do_commit(self):
-        try:
-            if not self.assigned: raise Exception('rebalancing')
-            if not self._join_task:
-                self._join_task = asyncio.ensure_future(self._do_join())
-            await asyncio.shield(self._join_task)
-            if not self.assigned: raise Exception('rebalancing')
-            if self._closed: raise Exception('closed')
-            if self._txn_manager:
-                await self.begin_transaction()
-            self.ready = True
-            if self._tasks:
-                await asyncio.wait([
-                        task.after_commit() for task in self._tasks])
-        finally:
-            self._commit_task = None
+        assert self._state is ApplicationState.COMMIT
+        if not self._join_task:
+            self._join_task = asyncio.ensure_future(self._do_join())
+        await asyncio.shield(self._join_task)
+        assert self._state is ApplicationState.COMMIT
+        if self._txn_manager:
+            await self.begin_transaction()
+        self.ready = True
+        if self._tasks:
+            await asyncio.wait([
+                    task.after_commit() for task in self._tasks])
 
     async def _do_auto_commit(self):
         if not self._enable_auto_commit or not self.assigned: return
