@@ -168,7 +168,7 @@ class AIOKafkaClient:
         if futs:
             await asyncio.gather(*futs, loop=self._loop)
 
-    async def bootstrap(self, init=None):
+    async def bootstrap(self):
         """Try to to bootstrap initial cluster metadata"""
         # using request v0 for bootstap if not sure v1 is available
         if self._api_version == "auto" or self._api_version < (0, 10):
@@ -209,13 +209,6 @@ class AIOKafkaClient:
                 continue
 
             self.cluster.update_metadata(metadata)
-
-            if init:
-                try:
-                    await init(bootstrap_conn)
-                except KafkaError:
-                    bootstrap_conn.close()
-                    raise
 
             # A cluster with no topics can return no broker metadata...
             # In that case, we should keep the bootstrap connection till

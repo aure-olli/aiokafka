@@ -589,56 +589,63 @@ class AIOKafkaApplication(object):
             return
         elif self._state is ApplicationState.PROCESS:
             self._state = ApplicationState.COMMIT
+            assert not self._join_task and self._commit_task
+            self._join_task = True
             self._commit_task = asyncio.ensure_future(self._do_commit())
             await asyncio.shield(self._commit_task)
         else:
             raise RuntimeError('state ??? ' + self._state)
 
     async def before_rebalance(self, revoked):
+        if not self._rebalance:
+            self._rebalance = asyncio.Future()
+
         while True:
             if self._state in (
                     ApplicationState.PROCESS, ApplicationState.REBALANCE):
                 break
             elif self._state is ApplicationState.COMMIT:
+                assert self._commit_task
                 if self._join_task:
-                    if self._commit_task:
-                        self._commit_task.cancel()
-                        self._commit_task = None
+                    self._commit_task.cancel()
+                    self._commit_task = None
                     break
-                await asyncio.shield(self._commit_task)
+                try: await asyncio.shield(self._commit_task)
+                except: pass
             else:
                 raise RuntimeError('state ??? ' + self._state)
 
+        self._state = ApplicationState.REBALANCE
         if not self._commit_task:
             self._commit_task = asyncio.ensure_future(
                     self._do_brefore_rebalance())
-        return await asyncio.shield(self._commit_task)
+        try: await asyncio.shield(self._commit_task)
+        except asyncio.CancelledError: pass
 
-        # self.assigned = False
-        # if self._auto_commit_task:
-        #     self._auto_commit_task.cancel()
-        #     self._auto_commit_task = None
-        # if not self._join_task:
-        #     self._join_task = asyncio.ensure_future(self._do_join())
-        # if self._tasks:
-        #     await asyncio.wait([self._join_task] +
-        #             [task.before_rebalance(revoked) for task in self._tasks])
-        # await self._stop_restoration_streams()
-        # self._offsets.clear()
-        # self._commits.clear()
+    async def _do_brefore_rebalance(self):
+        assert self._state is ApplicationState.REBALANCE and self._rebalance
+        assert self._join_task
+        if self._join_task is True:
+            self._join_task = asyncio.ensure_future(self._do_join())
+        await asyncio.shield(self._join_task)
+        if self._tasks:
+            await asyncio.wait(
+                    [task.before_rebalance(revoked) for task in self._tasks])
+        await self._stop_restoration_streams()
+        self._offsets.clear()
+        self._commits.clear()
 
     async def after_rebalance(self, assigned):
-        if self._closed: raise Exception('closed')
+        assert self._state is ApplicationState.REBALANCE and self._rebalance
         if self._txn_manager:
             await self.begin_transaction()
-        self.assigned = True
-        self.ready = True
         if self._tasks:
             await asyncio.wait([
                     task.after_rebalance(assigned) for task in self._tasks])
         if not self._auto_commit_task:
             self._auto_commit_task = asyncio.ensure_future(
                     self._do_auto_commit())
+        self._rebalance.set_result(None)
 
     async def abort(self):
         self.assigned = False
@@ -682,7 +689,8 @@ class AIOKafkaApplication(object):
 
     async def _do_commit(self):
         assert self._state is ApplicationState.COMMIT
-        if not self._join_task:
+        assert self._join_task
+        if self._join_task is True:
             self._join_task = asyncio.ensure_future(self._do_join())
         await asyncio.shield(self._join_task)
         assert self._state is ApplicationState.COMMIT
@@ -1038,3 +1046,484 @@ class AIOKafkaApplication(object):
             formatted_offsets, group_id)
         fut = self._txn_manager.add_offsets_to_txn(formatted_offsets, group_id)
         await asyncio.shield(fut, loop=self._loop)
+
+
+
+
+class Application:
+
+    def __init__(self, loop=None,
+            bootstrap_servers='localhost',
+            client_id='aiokafka-' + __version__,
+            group_id=None,
+            key_deserializer=None, value_deserializer=None,
+            fetch_max_wait_ms=500,
+            fetch_max_bytes=52428800,
+            fetch_min_bytes=1,
+            max_partition_fetch_bytes=1 * 1024 * 1024,
+            acks=-1,
+            key_serializer=None, value_serializer=None,
+            compression_type=None,
+            max_batch_size=16384,
+            partitioner=DefaultPartitioner(),
+            max_request_size=1048576,
+            linger_ms=0,
+            send_backoff_ms=100,
+            enable_idempotence=False,
+            transactional_id=None,
+            transaction_timeout_ms=60000,
+            request_timeout_ms=40 * 1000,
+            retry_backoff_ms=100,
+            auto_offset_reset='latest',
+            enable_auto_commit=True,
+            auto_commit_interval_ms=5000,
+            check_crcs=True,
+            metadata_max_age_ms=5 * 60 * 1000,
+            partition_assignment_strategy=None,
+            consumer_protocol=ApplicationConsumerProtocol,
+            max_poll_interval_ms=300000,
+            rebalance_timeout_ms=None,
+            session_timeout_ms=10000,
+            heartbeat_interval_ms=3000,
+            consumer_timeout_ms=200,
+            max_poll_records=None,
+            max_poll_records_per_partition=None,
+            ssl_context=None,
+            security_protocol='PLAINTEXT',
+            api_version='auto',
+            exclude_internal_topics=True,
+            connections_max_idle_ms=540000,
+            isolation_level="read_uncommitted",
+            sasl_mechanism="PLAIN",
+            sasl_plain_password=None,
+            sasl_plain_username=None,
+            sasl_kerberos_service_name='kafka',
+            sasl_kerberos_domain_name=None,
+            create_topic_timeout_ms=60000,
+            create_topic_refresh_ms=100,
+
+            topic_partitions=None,
+            topic_replicas=None,
+            topic_compacting=None,
+            topic_deleting=None,
+            topic_retention_ms=None,
+            topic_retention_bytes=None,
+            topic_config=None):
+
+        self._client_options = dict(
+            bootstrap_servers=bootstrap_servers,
+            client_id=client_id,
+            metadata_max_age_ms=metadata_max_age_ms,
+            request_timeout_ms=request_timeout_ms,
+            retry_backoff_ms=retry_backoff_ms,
+            api_version=api_version,
+            ssl_context=ssl_context,
+            security_protocol=security_protocol,
+            connections_max_idle_ms=connections_max_idle_ms,
+            sasl_mechanism=sasl_mechanism,
+            sasl_plain_username=sasl_plain_username,
+            sasl_plain_password=sasl_plain_password,
+            sasl_kerberos_service_name=sasl_kerberos_service_name,
+            sasl_kerberos_domain_name=sasl_kerberos_domain_name,
+        )
+
+        self._consumer_options = dict(
+            fetch_max_wait_ms=fetch_max_wait_ms,
+            fetch_max_bytes=fetch_max_bytes,
+            fetch_min_bytes=fetch_min_bytes,
+            max_partition_fetch_bytes=max_partition_fetch_bytes,
+            request_timeout_ms=request_timeout_ms,
+            retry_backoff_ms=retry_backoff_ms,
+            enable_auto_commit=False,
+            check_crcs=check_crcs,
+            consumer_protocol=consumer_protocol,
+            max_poll_interval_ms=max_poll_interval_ms,
+            rebalance_timeout_ms=rebalance_timeout_ms,
+            session_timeout_ms=session_timeout_ms,
+            heartbeat_interval_ms=heartbeat_interval_ms,
+            consumer_timeout_ms=consumer_timeout_ms,
+            max_poll_records=max_poll_records,
+            max_poll_records_per_partition=max_poll_records_per_partition,
+        )
+        self._main_consumer_options = dict(
+            group_id=group_id,
+            auto_offset_reset=auto_offset_reset,
+            partition_assignment_strategy=partition_assignment_strategy,
+            isolation_level=isolation_level,
+            **self._consumer_options,
+        )
+        self._table_consumer_options = dict(
+            auto_offset_reset='earliest',
+            partition_assignment_strategy=None,
+            isolation_level='read_committed',
+            **self._consumer_options,
+        )
+        self._producer_options = dict(
+            request_timeout_ms=request_timeout_ms,
+            compression_type=compression_type,
+            max_batch_size=max_batch_size,
+            partitioner=partitioner,
+            max_request_size=max_request_size,
+            linger_ms=linger_ms,
+            send_backoff_ms=send_backoff_ms,
+            retry_backoff_ms=retry_backoff_ms,
+            enable_idempotence=enable_idempotence,
+            transactional_id=transactional_id,
+            transaction_timeout_ms=transaction_timeout_ms,
+        )
+
+        self._topic_options = dict(
+            partitions=topic_partitions,
+            replicas=topic_replicas,
+            compacting=topic_compacting,
+            deleting=topic_deleting,
+            retention_ms=topic_retention_ms,
+            retention_bytes=topic_retention_bytes,
+            config=topic_config,
+        )
+
+        self._state = ApplicationState.INIT
+        self._ready_waiter = None
+        self._assign_waiter = None
+        self._offsets = {}
+        self._commits = {}
+        self._tasks = set()
+        self._auto_commit_task = None
+        self._restoration_consumer = None
+        self._restoration_streams = []
+        self._join_task = None
+        self._commit_task = None
+        self._rebalance_state = None
+
+    async def start(self):
+        loop = asyncio.get_event_loop()
+        self.client = AIOKafkaClient(loop=loop, **self._client_options)
+        await self.client.bootstrap()
+        await self.check_topics()
+        self.consumer = ClientConsumer(loop=loop, **self._consumer_options)
+        self.producer = ClientProducer(loop=loop, **self._producer_options)
+        await self.producer.start()
+        if self._has_txn:
+            await self.producer.begin_transaction()
+        await self.consumer.start()
+
+    def ensure_topic(self, topic,
+              partitions,
+              replicas,
+              group=None,
+              *,
+              compacting=None,
+              deleting=None,
+              retention_ms=None,
+              retention_bytes=None,
+              config=None):
+        if group is not None and group != topic:
+            self._equipartitioned.append({topic, group})
+        if group == topic: group = None
+        if topic in self._topic_configs:
+            raise ValueError(f'topic {topic} already declared')
+        self._topic_configs[topic] = TopicConfig(self, topic,
+            partitions=partitions,
+            replicas=replicas,
+            compacting=compacting,
+            deleting=deleting,
+            retention_ms=retention_ms,
+            retention_bytes=retention_bytes,
+            config=config)
+
+    async def check_topics(self):
+        equipartitioned = {}
+        for group in self._equipartitioned:
+            seen = set()
+            groups = [group]
+            for topic in group:
+                while topic not in seen:
+                    seen.add(topic)
+                    v = equipartitioned.get(topic)
+                    if isinstance(v, set):
+                        groups.append(v)
+                        break
+                    elif v is None:
+                        break
+                    else:
+                        topic = v
+            i, group = min(enumerate(groups), key=lambda t: len(t[1]))
+            for j, g in enumerate(groups):
+                if j == i: continue
+                group.update(g)
+            for topic in group:
+                for t in seen: equipartitioned[t] = topic
+            equipartitioned[topic] = group
+        equipartitioned = [group for group in
+                equipartitioned.values() if isinstance(group, set)]
+        topic_group = {}
+        for i, group in enumerate(equipartitioned):
+            topic_group.update((topic, i) for topic in group)
+        group_partitions = [None for _ in equipartitioned]
+        self._topic_group = topic_group
+        self._equipartitioned = equipartitioned
+
+        all_topics = set(self._topic_configs)
+        all_topics.update(self._subscriptions)
+        all_topics.update(topic_group)
+
+        tocreate = set()
+        for topic in all_topics:
+            partitions = self.client.cluster.partitions_for_topic(topic)
+            if partitions is None:
+                tocreate.add(topic)
+            elif topic in topic_group:
+                index = topic_group[topic]
+                pts = group_partitions[index]
+                if pts is None:
+                    group_partitions[index] = partitions
+                elif pts != partitions:
+                    raise RuntimeError('group %s is not equipartitioned' % \
+                            (tuple(equipartitioned[index]),))
+        if (not self._topic_options.replicas
+                and not tocreate <= set(self._topic_configs)
+            or not self._topic_options.partitions
+                and not set(topic_group[topic] for topic in tocreate) <=
+                    set(index for index, pts in group_partitions
+                        if pts is not None)):
+            raise RuntimeError('topics %s do not exist' %
+                    (tuple(tocreate - set(self._topic_configs)),))
+        if not tocreate: return
+        node_id = self.client.get_random_node()
+
+        topics = []
+        for topic in tocreate:
+            partitions = None
+            if topic in topic_group:
+                partitions = group_partitions[topic_group[topic]]
+                if partitions is not None:
+                    assert partitions == set(range(len(partitions)))
+                    partitions = len(partitions)
+            if topic in self._topic_configs:
+                config = self._topic_configs[topic]
+            else:
+                config = TopicConfig(topic, **self._topic_options)
+            topics.append(config.request(partitions))
+
+        print ('create', topics)
+        if self.client.api_version < (0, 10):
+            request = CreateTopicsRequest[0](topics,
+                    self._create_topic_timeout_ms)
+        else:
+            request = CreateTopicsRequest[1](topics,
+                    self._create_topic_timeout_ms, False)
+
+        timeout = self._create_topic_timeout_ms / 1000
+        start_time = self._loop.time()
+        response = await self.client.send(node_id, request, timeout=timeout)
+        timeout -= self._loop.time() - start_time
+
+        for topic, code, reason in response.topic_errors:
+            if code != 0:
+                if code == TopicAlreadyExistsError.errno:
+                    pass
+                # elif code == NotControllerError.errno:
+                #     raise RuntimeError(f'Invalid controller: {controller_node}')
+                else:
+                    raise for_code(code)(
+                        f'Cannot create topic: {topic} ({code}): {reason}')
+
+        while timeout > 0:
+            start_time = self._loop.time()
+
+            if self.client.api_version < (0, 10):
+                metadata_request = MetadataRequest[0]([])
+            else:
+                metadata_request = MetadataRequest[1]([])
+            metadata = await self.client.send(
+                    node_id, metadata_request, timeout=timeout)
+            self.client.cluster.update_metadata(metadata)
+
+            for topic in self._topics:
+                partitions = self.client.cluster.partitions_for_topic(topic)
+                if partitions is None:
+                    break
+                elif topic in topic_group:
+                    group = topic_group[topic]
+                    if group_partitions[group] is None:
+                        group_partitions[group] = partitions
+                    elif group_partitions[group] != partitions:
+                        raise RuntimeError('different partitions')
+            else:
+                break
+
+            ellapsed = self._loop.time() - start_time
+            timeout -= ellapsed
+            sleep = min(timeout, self._create_topic_refresh - ellapsed)
+            if sleep <= 0:
+                await asyncio.sleep(sleep)
+                timeout -= sleep
+        else:
+            raise RuntimeError('cannot create topic')
+
+
+    async def commit(self):
+        if self._state is ApplicationState.COMMIT:
+            await asyncio.shield(self._commit_task)
+        elif self._state is ApplicationState.PROCESS:
+            self._state = ApplicationState.COMMIT
+            assert not self._join_task
+            assert not self._commit_task
+            if not self._ready_waiter:
+                self._ready_waiter = asyncio.Future()
+            self._join_task = asyncio.ensure_future(self._do_join())
+            self._commit_task = asyncio.ensure_future(self._do_commit())
+            await asyncio.shield(self._commit_task)
+        else:
+            raise RuntimeError('state ??? ' + self._state)
+
+    async def before_rebalance(self, revoked):
+        while True:
+            if self._state in (
+                    ApplicationState.PROCESS, ApplicationState.INIT):
+                assert not self._join_task
+                assert not self._commit_task
+                self._join_task = asyncio.ensure_future(self._do_join())
+                break
+            elif self._state is ApplicationState.COMMIT:
+                assert self._commit_task
+                if self._join_task:
+                    self._commit_task.cancel()
+                    self._commit_task = None
+                    break
+                try: await asyncio.shield(self._commit_task)
+                except: pass
+            else:
+                raise RuntimeError('state ??? ' + self._state)
+        if not self._assign_waiter:
+            self._assign_waiter = asyncio.Future()
+        if not self._ready_waiter:
+            self._ready_waiter = asyncio.Future()
+        self._state = ApplicationState.REBALANCE
+        if self._auto_commit_task:
+            self._auto_commit_task.cancel()
+            self._auto_commit_task = None
+        self._commit_task = asyncio.ensure_future(
+                self._do_before_rebalance(revoked))
+        await asyncio.shield(self._commit_task)
+        self._commit_task = None
+
+    async def _do_before_rebalance(self, revoked):
+        assert self._state is ApplicationState.REBALANCE and self._assign_waiter
+        tasks = [self._join_task]
+        tasks.extend(task.before_rebalance(revoked) for task in self._tasks)
+        await asyncio.gather(**tasks)
+        await self._stop_restoration_streams()
+        self._offsets.clear()
+        self._commits.clear()
+        self._join_task = None
+        self._commit_task = None
+
+    async def after_rebalance(self, assigned):
+        assert self._state is ApplicationState.REBALANCE and self._assign_waiter
+        assert not self._join_task
+        assert not self._commit_task
+        self._commit_task = asyncio.ensure_future(
+                self._do_after_rebalance(assigned))
+        await asyncio.shield(self._commit_task)
+
+    async def _do_after_rebalance(self, assigned):
+        assert self._state is ApplicationState.REBALANCE and self._assign_waiter
+        assert not self._join_task
+        assert not self._commit_task
+        if self._has_txn:
+            await self.producer.begin_transaction()
+        if self._tasks:
+            tasks = [task.after_rebalance(assigned) for task in self._tasks]
+            await asyncio.gather(*tasks)
+        if not self._auto_commit_task:
+            self._auto_commit_task = asyncio.ensure_future(
+                    self._do_auto_commit())
+        self._state = ApplicationState.PROCESS
+        self._commit_task = None
+        self._assign_waiter.set_result(None)
+        self._assign_waiter = None
+        self._ready_waiter.set_result(None)
+        self._ready_waiter = None
+
+    async def abort(self):
+        assert self._state not in ApplicationState.ERROR
+        if self._state is ApplicationState.INIT:
+            return
+        elif self._state is ApplicationState.ABORT:
+            await asyncio.shield(self._commit_task)
+        else:
+            self._state = ApplicationState.ABORT
+            if self._auto_commit_task:
+                self._auto_commit_task.cancel()
+                self._auto_commit_task = None
+            if self._commit_task:
+                self._commit_task.cancel()
+                self._commit_task = None
+            if self._join_task:
+                self._join_task.cancel()
+                self._join_task = None
+            if self._assign_waiter:
+                self._assign_waiter.cancel()
+                self._assign_waiter = asyncio.Future()
+            if self._ready_waiter:
+                self._ready_waiter.cancel()
+                self._ready_waiter = asyncio.Future()
+            self._commit_task = asyncio.ensure_future(self._do_abort())
+            await asyncio.shield(self._commit_task)
+
+    async def _do_abort(self):
+        tasks = [task.abort() for task in self._tasks]
+        await asyncio.gather(*tasks)
+        await self._stop_restoration_streams()
+        self._offsets.clear()
+        self._commits.clear()
+        await self.consumer.stop()
+        await self.producer.stop()
+        self.client.set_topics(())
+        self._state = ApplicationState.INIT
+        self._commit_task = None
+
+    async def _do_join(self):
+        """
+        Wait for all tasks to be ready to commit
+        Pushes all the remaining messages and offsets
+        Commits the transaction
+        """
+        if self._tasks:
+            await asyncio.gather(*(task.before_commit()
+                    for task in self._tasks))
+        # even offsets of unread partitions should be committed
+        # to avoid using `auto_offset_reset` after a reassignment
+        commits = self._group_id and self.consumer.consumed_offsets()
+        if commits:
+            commits.update(self._commits)
+        if commits:
+        # if self._group_id and self._commits:
+            if self._txn_manager:
+                await self.producer.send_offsets_to_transaction(
+                       commits, self._group_id)
+            else:
+                await self.consumer.commit(commits)
+        await self.producer.flush()
+        if self._has_txn:
+            await self.producer.commit_transaction()
+
+    async def _do_commit(self):
+        assert self._state is ApplicationState.COMMIT
+        assert self._join_task
+        if self._join_task is True:
+            self._join_task = asyncio.ensure_future(self._do_join())
+        await asyncio.shield(self._join_task)
+        self._join_task = None
+        assert self._state is ApplicationState.COMMIT
+        if self._txn_manager:
+            await self.begin_transaction()
+        self.ready = True
+        if self._tasks:
+            await asyncio.wait([
+                    task.after_commit() for task in self._tasks])
+        self._state = ApplicationState.PROCESS
+        self._commit_task = None
+        self._ready_waiter.set_result(None)
+        self._ready_waiter = None
