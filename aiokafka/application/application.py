@@ -317,6 +317,7 @@ class Application:
         self.consumer = None
         self.producer = None
         self._has_txn = transactional_id is not None or enable_idempotence
+        self._group_id = group_id
 
         self._enable_auto_commit = enable_auto_commit
         self._auto_commit_interval_ms = auto_commit_interval_ms
@@ -365,14 +366,15 @@ class Application:
         if self._has_txn:
             await self.producer.begin_transaction()
         self.consumer = ClientConsumer(
-                loop=self._loop, client=self.client, **self._consumer_options)
+                loop=self._loop, client=self.client, **self._main_consumer_options)
         self.consumer.subscribe(list(self._subscriptions),
                 listener=RebalanceListener(self))
         await self.consumer.start()
-        self._state = ApplicationState.PROCESS
-        if not self._auto_commit_task:
-            self._auto_commit_task = asyncio.ensure_future(
-                    self._do_auto_commit())
+        if self._state is ApplicationState.INIT:
+            self._state = ApplicationState.PROCESS
+            if not self._auto_commit_task:
+                self._auto_commit_task = asyncio.ensure_future(
+                        self._do_auto_commit())
 
     def ensure_topic(self, topic,
               partitions,
@@ -642,7 +644,7 @@ class Application:
         assert self._state is ApplicationState.REBALANCE and self._assign_waiter
         tasks = [self._join_task]
         tasks.extend(task.before_rebalance(revoked) for task in self._tasks)
-        await asyncio.gather(**tasks)
+        await asyncio.gather(*tasks)
         await self._stop_restoration_streams()
         self._offsets.clear()
         self._commits.clear()
@@ -736,7 +738,7 @@ class Application:
             commits.update(self._commits)
         if commits:
         # if self._group_id and self._commits:
-            if self._txn_manager:
+            if self._has_txn:
                 await self.producer.send_offsets_to_transaction(
                        commits, self._group_id)
             else:
@@ -754,9 +756,8 @@ class Application:
         await asyncio.shield(self._join_task)
         self._join_task = None
         assert self._state is ApplicationState.COMMIT
-        if self._txn_manager:
+        if self._has_txn:
             await self.producer.begin_transaction()
-        self.ready = True
         if self._tasks:
             await asyncio.wait([
                     task.after_commit() for task in self._tasks])
@@ -764,6 +765,12 @@ class Application:
         self._commit_task = None
         self._ready_waiter.set_result(None)
         self._ready_waiter = None
+
+    async def _do_auto_commit(self):
+        if not self._enable_auto_commit or not self.assigned: return
+        while True:
+            await asyncio.sleep(self._auto_commit_interval_ms / 1000)
+            await self.commit()
 
     async def position(self, partition):
         offset = self._offsets.get(partition)

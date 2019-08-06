@@ -6,7 +6,6 @@ import string
 loop = asyncio.get_event_loop()
 
 from aiokafka.consumer import AIOKafkaConsumer
-from aiokafka.application import AIOKafkaApplication
 from aiokafka.application.tasks import AbstractTask, get_parition
 from aiokafka.structs import TopicPartition
 
