@@ -115,6 +115,19 @@ class PartitionArgument(abc.ABC):
         pass
 
 
+def catch_on_error(fun):
+    async def aux(self, *kargs, **kwargs):
+        try:
+            return await fun(self, *kargs, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await self.on_error(e)
+            raise
+    aux.__name__ = fun.__name__
+    return aux
+
+
 class PartitionTask(AbstractTask):
     """
     A task that will run a function for each partition available
@@ -139,6 +152,7 @@ class PartitionTask(AbstractTask):
         if len(group) > 1:
             app.group(*group)
 
+    @catch_on_error
     async def before_rebalance(self, revoked):
         # commit if not already done
         await self.before_commit()
@@ -155,6 +169,7 @@ class PartitionTask(AbstractTask):
                 await asyncio.wait([task])
         else: raise RuntimeError('state ??? ' + self._state.name)
 
+    @catch_on_error
     async def after_rebalance(self, assigned):
         # not started yet, don't start anything
         if self._state is TaskState.INIT:
@@ -165,6 +180,7 @@ class PartitionTask(AbstractTask):
             self._task = asyncio.ensure_future(self._run())
         else: raise RuntimeError('state ??? ' + self._state.name)
 
+    @catch_on_error
     async def before_commit(self):
         # already committing, nothing to do
         if self._state in (TaskState.COMMIT, TaskState.REBALANCE):
@@ -217,6 +233,7 @@ class PartitionTask(AbstractTask):
             return await self._commit
         else: raise RuntimeError('state ??? ' + self._state.name)
 
+    @catch_on_error
     async def after_commit(self):
         # not started yet, don't start anything
         if self._state is TaskState.INIT:
@@ -232,6 +249,7 @@ class PartitionTask(AbstractTask):
                 await asyncio.gather(*(arg.after_commit() for arg in self._pargs))
         else: raise RuntimeError('state ??? ' + self._state.name)
 
+    @catch_on_error
     async def start(self):
         self._app.register_task(self)
         # ready to start
@@ -267,6 +285,13 @@ class PartitionTask(AbstractTask):
             self._task.cancel()
             await asyncio.wait([self._task])
 
+    async def abort(self):
+        await self.close()
+
+    async def on_error(self, exc):
+        await self._app.on_error(exc)
+
+    @catch_on_error
     async def _run(self):
         """The main coroutine"""
         # get the partition of all the partitionables
@@ -302,7 +327,7 @@ class PartitionTask(AbstractTask):
         try:
             tasks = [asyncio.ensure_future(self._run_partition(partition, *arg))
                     for partition, arg in args.items()]
-            await asyncio.wait(tasks)
+            await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -346,7 +371,7 @@ class PartitionTask(AbstractTask):
         try:
             if pargs:
                 tasks = [asyncio.ensure_future(arg.start()) for arg in pargs]
-                await asyncio.wait(tasks)
+                await asyncio.gather(*tasks)
                 tasks = None
             # TODO : stop  pargs of a task once finished
             await asyncio.ensure_future(self._fun(*kargs, **kwargs))

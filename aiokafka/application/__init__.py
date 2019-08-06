@@ -1,1 +1,1 @@
-from .application import AIOKafkaApplication
+from .application import Application

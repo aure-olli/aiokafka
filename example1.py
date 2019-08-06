@@ -7,7 +7,7 @@ import traceback
 loop = asyncio.get_event_loop()
 
 from aiokafka.consumer import AIOKafkaConsumer
-from aiokafka.application import AIOKafkaApplication
+from aiokafka.application import Application
 from aiokafka.application.tasks import AbstractTask, get_parition
 from aiokafka.structs import TopicPartition
 
@@ -26,7 +26,7 @@ while True:
 	length = sum(len(r) for r in allvalues.values())
 	print ('run for', duration)
 	local_loop = asyncio.new_event_loop()
-	app = AIOKafkaApplication(loop=local_loop,
+	app = Application(loop=local_loop,
 			auto_offset_reset='earliest', group_id='test',
 			max_partition_fetch_bytes=20000,
 			isolation_level='read_committed',
