@@ -16,7 +16,7 @@ loop.run_until_complete(consumer.start())
 
 allvalues = collections.defaultdict(list)
 
-unseen = set(range(50000))
+unseen = set(range(10000))
 async def check():
 	allvalues.clear()
 	async for msg in consumer:
@@ -30,7 +30,7 @@ loop.run_until_complete(consumer.stop())
 
 print (sum(len(r) for r in allvalues.values()))
 print (sorted((p, len(r)) for p, r in allvalues.items()))
-print (unseen)
+print (list(unseen)[:10])
 for (i, r) in allvalues.items():
 	index = {}
 	prev = None

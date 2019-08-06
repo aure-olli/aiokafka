@@ -241,6 +241,9 @@ class Application:
             topic_retention_bytes=None,
             topic_config=None):
 
+        if partition_assignment_strategy is None:
+            partition_assignment_strategy = (Assignator(self),)
+
         self._client_options = dict(
             bootstrap_servers=bootstrap_servers,
             client_id=client_id,
@@ -663,7 +666,6 @@ class Application:
     async def _do_after_rebalance(self, assigned):
         assert self._state is ApplicationState.REBALANCE and self._assign_waiter
         assert not self._join_task
-        assert not self._commit_task
         if self._has_txn:
             await self.producer.begin_transaction()
         if self._tasks:

@@ -115,6 +115,12 @@ while True:
 								key=lambda m: m.timestamp)
 					else: oldest = None
 					# we don't know what to wait for next
+
+				if random.random() < 0.0002:
+					print ('########################')
+					print ('######### 1 / 0 ########')
+					print ('########################')
+					1 / 0
 		except Exception as e:
 			print (partition, '!!! merge except', traceback.format_exc())
 			raise
